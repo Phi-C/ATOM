@@ -144,6 +144,18 @@ def register_omni_model() -> None:
     except ImportError as e:
         logger.warning(f"Could not patch wan2_2 pipelines with ATOM transformer: {e}")
 
+    try:
+        from atom.plugin.vllm_omni.diffusion.models.flux2.flux2_transformer import (
+            ATOMFlux2Transformer2DModel,
+        )
+
+        import vllm_omni.diffusion.models.flux2.pipeline_flux2 as pipeline_flux2
+
+        pipeline_flux2.Flux2Transformer2DModel = ATOMFlux2Transformer2DModel
+        logger.info("Patched Flux2Transformer2DModel → ATOMFlux2Transformer2DModel in flux2 pipeline")
+    except ImportError as e:
+        logger.warning(f"Could not patch flux2 pipeline with ATOM transformer: {e}")
+
     # Wrap initialize_model to call aiter TP init before every diffusion model is loaded.
     # Mirrors ATOMModelBase.__init__ → _prepare_env() in the vLLM OOT plugin:
     # one central point covers all diffusion models, no per-model initialization needed.

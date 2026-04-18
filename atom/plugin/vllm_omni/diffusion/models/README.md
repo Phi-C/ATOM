@@ -171,4 +171,5 @@ Calling `layer(x)` works as expected; `x_scale` and `otype` are used for quantiz
 
 | Model | Transformer file | Registered via |
 |-------|-----------------|----------------|
+| Flux2 | `flux2/flux2_transformer.py` | monkey-patch in `register.py` |
 | Wan2.2 (T2V / I2V / TI2V) | `wan2_2/wan2_2_transformer.py` | monkey-patch in `register.py` |
