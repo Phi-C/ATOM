@@ -23,7 +23,6 @@ logger = init_logger(__name__)
 
 
 class ATOMFeedForward(FeedForward):
-
     def __init__(
         self,
         dim: int,
@@ -56,7 +55,6 @@ class ATOMFeedForward(FeedForward):
 
 
 class ATOMQwenImageCrossAttention(QwenImageCrossAttention):
-
     def __init__(
         self,
         dim: int,
@@ -226,7 +224,6 @@ class ATOMQwenImageCrossAttention(QwenImageCrossAttention):
 
 
 class ATOMQwenImageTransformerBlock(QwenImageTransformerBlock):
-
     def __init__(
         self,
         dim: int,
@@ -262,7 +259,6 @@ class ATOMQwenImageTransformerBlock(QwenImageTransformerBlock):
 
 
 class ATOMQwenImageTransformer2DModel(QwenImageTransformer2DModel):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Collect block constructor args from the already-built first block to stay DRY.

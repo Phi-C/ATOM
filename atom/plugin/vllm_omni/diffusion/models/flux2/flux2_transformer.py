@@ -42,7 +42,9 @@ class ATOMFlux2FeedForward(Flux2FeedForward):
         inner_dim = self.linear_in.output_sizes[0]
         dim_out = self.linear_out.output_size
         bias = self.linear_in.bias is not None
-        self.linear_in = MergedColumnParallelLinear(dim, [inner_dim, inner_dim], bias=bias)
+        self.linear_in = MergedColumnParallelLinear(
+            dim, [inner_dim, inner_dim], bias=bias
+        )
         self.linear_out = RowParallelLinear(inner_dim, dim_out, bias=bias)
 
 
@@ -78,7 +80,9 @@ class ATOMFlux2Attention(Flux2Attention):
             )
             self.add_query_num_heads = self.add_kv_proj.num_heads
             self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
-            self.to_add_out = RowParallelLinear(self.inner_dim, self.query_dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(
+                self.inner_dim, self.query_dim, bias=out_bias
+            )
 
     def forward(
         self,
@@ -88,7 +92,9 @@ class ATOMFlux2Attention(Flux2Attention):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        has_context = encoder_hidden_states is not None and self.added_kv_proj_dim is not None
+        has_context = (
+            encoder_hidden_states is not None and self.added_kv_proj_dim is not None
+        )
 
         qkv = self.to_qkv(hidden_states)
         query, key, value = qkv.chunk(3, dim=-1)

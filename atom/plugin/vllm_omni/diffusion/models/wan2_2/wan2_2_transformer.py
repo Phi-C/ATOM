@@ -25,7 +25,6 @@ logger = init_logger(__name__)
 
 
 class ATOMWanCrossAttention(WanCrossAttention):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Replace vllm ColumnParallelLinear with atom versions
@@ -52,7 +51,6 @@ class ATOMWanCrossAttention(WanCrossAttention):
 
 
 class ATOMWanSelfAttention(WanSelfAttention):
-
     def __init__(
         self,
         dim: int,
@@ -114,7 +112,6 @@ class ATOMWanSelfAttention(WanSelfAttention):
 
 
 class ATOMWanFeedForward(WanFeedForward):
-
     def __init__(
         self, dim: int, inner_dim: int, dim_out: int | None = None, bias: bool = True
     ):
@@ -130,7 +127,6 @@ class ATOMWanFeedForward(WanFeedForward):
 
 
 class ATOMWanTransformerBlock(WanTransformerBlock):
-
     def __init__(
         self,
         dim: int,
@@ -164,7 +160,6 @@ class ATOMWanTransformerBlock(WanTransformerBlock):
 
 
 class ATOMWanTransformer3DModel(WanTransformer3DModel):
-
     def __init__(
         self,
         patch_size: tuple[int, int, int] = (1, 2, 2),

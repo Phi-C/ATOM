@@ -152,7 +152,9 @@ def register_omni_model() -> None:
         import vllm_omni.diffusion.models.flux2.pipeline_flux2 as pipeline_flux2
 
         pipeline_flux2.Flux2Transformer2DModel = ATOMFlux2Transformer2DModel
-        logger.info("Patched Flux2Transformer2DModel → ATOMFlux2Transformer2DModel in flux2 pipeline")
+        logger.info(
+            "Patched Flux2Transformer2DModel → ATOMFlux2Transformer2DModel in flux2 pipeline"
+        )
     except ImportError as e:
         logger.warning(f"Could not patch flux2 pipeline with ATOM transformer: {e}")
 
