@@ -126,25 +126,6 @@ def register_omni_model() -> None:
         )
 
     try:
-        from atom.plugin.vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
-            ATOMWanTransformer3DModel,
-        )
-
-        import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as pipeline_wan2_2
-        import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v as pipeline_wan2_2_i2v
-        import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_ti2v as pipeline_wan2_2_ti2v
-
-        pipeline_wan2_2.WanTransformer3DModel = ATOMWanTransformer3DModel
-        pipeline_wan2_2_i2v.WanTransformer3DModel = ATOMWanTransformer3DModel
-        pipeline_wan2_2_ti2v.WanTransformer3DModel = ATOMWanTransformer3DModel
-
-        logger.info(
-            "Patched WanTransformer3DModel → ATOMWanTransformer3DModel in wan2_2 pipelines"
-        )
-    except ImportError as e:
-        logger.warning(f"Could not patch wan2_2 pipelines with ATOM transformer: {e}")
-
-    try:
         from atom.plugin.vllm_omni.diffusion.models.flux2.flux2_transformer import (
             ATOMFlux2Transformer2DModel,
         )

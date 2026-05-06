@@ -12,7 +12,7 @@ The plugin hooks into vllm-omni at startup via `register_omni_model()` in `atom/
 
 ## How to Add a New Model
 
-Follow the pattern used for Wan2.2 in `wan2_2/wan2_2_transformer.py`.
+Follow the pattern used for Flux2 in `flux2/flux2_transformer.py`.
 
 ### Step 1: Identify what to replace
 
@@ -172,4 +172,4 @@ Calling `layer(x)` works as expected; `x_scale` and `otype` are used for quantiz
 | Model | Transformer file | Registered via |
 |-------|-----------------|----------------|
 | Flux2 | `flux2/flux2_transformer.py` | monkey-patch in `register.py` |
-| Wan2.2 (T2V / I2V / TI2V) | `wan2_2/wan2_2_transformer.py` | monkey-patch in `register.py` |
+| Qwen-Image | `qwen_image/qwen_image_transformer.py` | monkey-patch in `register.py` |
