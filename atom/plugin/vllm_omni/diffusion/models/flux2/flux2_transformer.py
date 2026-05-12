@@ -277,6 +277,7 @@ class ATOMFlux2Transformer2DModel(Flux2Transformer2DModel):
         "ATOMFlux2TransformerBlock",
         "ATOMFlux2SingleTransformerBlock",
     ]
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
