@@ -21,6 +21,10 @@ from vllm_omni.diffusion.models.flux2.flux2_transformer import (
     Flux2TransformerBlock,
 )
 
+from atom.plugin.vllm_omni.diffusion.models.flux2.fused_qk_norm_rope import (
+    try_fused_qk_norm_rope_2way,
+)
+
 
 def _gather_last_dim(hidden_states: torch.Tensor) -> torch.Tensor:
     tp_group = get_tp_group()
@@ -108,27 +112,48 @@ class ATOMFlux2Attention(Flux2Attention):
         key = key.unflatten(-1, (self.kv_num_heads, -1))
         value = value.unflatten(-1, (self.kv_num_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
         if has_context:
             encoder_query = encoder_query.unflatten(-1, (self.add_query_num_heads, -1))
             encoder_key = encoder_key.unflatten(-1, (self.add_kv_num_heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.add_kv_num_heads, -1))
 
-            encoder_query = self.norm_added_q(encoder_query)
-            encoder_key = self.norm_added_k(encoder_key)
-
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
-
+        fused_qk = None
         if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
-            cos = cos.to(query.dtype)
-            sin = sin.to(query.dtype)
-            query = self.rope(query, cos, sin)
-            key = self.rope(key, cos, sin)
+            fused_qk = try_fused_qk_norm_rope_2way(
+                query=query,
+                key=key,
+                norm_q=self.norm_q,
+                norm_k=self.norm_k,
+                image_rotary_emb=image_rotary_emb,
+                is_interleaved=self.rope.interleaved,
+                encoder_query=encoder_query if has_context else None,
+                encoder_key=encoder_key if has_context else None,
+                norm_added_q=self.norm_added_q if has_context else None,
+                norm_added_k=self.norm_added_k if has_context else None,
+            )
+
+        if fused_qk is not None:
+            query, key = fused_qk
+            if has_context:
+                value = torch.cat([encoder_value, value], dim=1)
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
+
+            if has_context:
+                encoder_query = self.norm_added_q(encoder_query)
+                encoder_key = self.norm_added_k(encoder_key)
+
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
+
+            if image_rotary_emb is not None:
+                cos, sin = image_rotary_emb
+                cos = cos.to(query.dtype)
+                sin = sin.to(query.dtype)
+                query = self.rope(query, cos, sin)
+                key = self.rope(key, cos, sin)
 
         attn_metadata = None
         if attention_mask is not None:
@@ -191,15 +216,29 @@ class ATOMFlux2ParallelSelfAttention(Flux2ParallelSelfAttention):
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
+        fused_qk = None
         if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
-            cos = cos.to(query.dtype)
-            sin = sin.to(query.dtype)
-            query = self.rope(query, cos, sin)
-            key = self.rope(key, cos, sin)
+            fused_qk = try_fused_qk_norm_rope_2way(
+                query=query,
+                key=key,
+                norm_q=self.norm_q,
+                norm_k=self.norm_k,
+                image_rotary_emb=image_rotary_emb,
+                is_interleaved=self.rope.interleaved,
+            )
+
+        if fused_qk is not None:
+            query, key = fused_qk
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
+
+            if image_rotary_emb is not None:
+                cos, sin = image_rotary_emb
+                cos = cos.to(query.dtype)
+                sin = sin.to(query.dtype)
+                query = self.rope(query, cos, sin)
+                key = self.rope(key, cos, sin)
 
         attn_metadata = None
         if attention_mask is not None:
