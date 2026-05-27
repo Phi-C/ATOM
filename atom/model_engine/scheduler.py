@@ -245,7 +245,7 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.context_lens = np.asarray(
-            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
+            [_seq.num_tokens for _seq in seqs.values()], dtype=np.int32
         )
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
@@ -289,9 +289,9 @@ class ScheduledBatch:
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
         self.last_block_num_tokens = [
-            seq.last_block_num_tokens for seq in seqs.values()
+            _seq.last_block_num_tokens for _seq in seqs.values()
         ]
-        self.num_cached_tokens = [seq.num_cached_tokens for seq in seqs.values()]
+        self.num_cached_tokens = [_seq.num_cached_tokens for _seq in seqs.values()]
 
         # Total number of tokens scheduled for all requests.
         self.total_tokens_num = total_tokens_num
@@ -413,6 +413,61 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+
+        # Cross-DP prefill alignment. Set by DPEngineCoreProc after
+        # dp_group is available. See `prefill_delayer.py` for rationale.
+        from atom.model_engine.prefill_delayer import PrefillDelayer
+
+        self.prefill_delayer: Optional[PrefillDelayer] = None
+
+    def set_prefill_delayer(self, delayer) -> None:
+        self.prefill_delayer = delayer
+
+    def _can_admit_head_prefill(self) -> bool:
+        """Match SGL's `local_prefillable=True` semantics: report True iff
+        this rank would *actually* admit a new prefill this tick.
+
+        Just having `self.waiting` non-empty is too coarse — during a
+        concurrent-burst workload (e.g. 1k/1k @ high concurrency) every
+        DP rank has a full waiting queue, so `bool(self.waiting)` is
+        ALWAYS True on all ranks → status="all" → delayer never engages.
+        But only the 1-2 ranks with free KV blocks actually admit a
+        prefill that tick; the other 6-7 ranks decode. That's the real
+        "mixed" we need to delay.
+
+        We peek the front of `waiting` (skipping a few unschedulable
+        entries) and check `can_allocate` + token-budget, mirroring the
+        same checks the admission while-loop runs below.
+        """
+        if not self.waiting:
+            return False
+        for i, seq in enumerate(self.waiting):
+            if i >= 4:
+                break
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            if num_new_tokens > self.max_num_batched_tokens:
+                continue
+            if self.block_manager.can_allocate(seq) < 0:
+                return False  # KV-pressured: definitely cannot prefill
+            return True
+        return False
+
+    def _kv_usage(self) -> float:
+        """Fraction of KV-cache blocks currently in use ∈ [0, 1].
+
+        Used as the `token_usage` signal for PrefillDelayer's low-watermark
+        safety valve. Derived from BlockManager bookkeeping; cheap (no
+        traversal of seq tables).
+        """
+        bm = self.block_manager
+        total = len(bm.blocks)
+        if total <= 0:
+            return 0.0
+        return len(bm.used_block_ids) / total
 
     def is_finished(self):
         # `_rejected` must be considered too: if a batch of seqs is all
@@ -541,11 +596,25 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
+        # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
+        _delayer_allows_prefill = True
+        if self.prefill_delayer is not None:
+            _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
+                local_prefillable=self._can_admit_head_prefill(),
+                token_usage=self._kv_usage(),
+            )
+
         if not self.running and not self.waiting:
             return None
 
-        # --- Prefill scheduling ---
-        while self.waiting and num_seqs_prefill < self.max_num_seqs:
+        # --- Prefill scheduling --- (gated by `_delayer_allows_prefill`
+        # computed at the very top of schedule() to keep the cross-DP
+        # collective aligned across all early-return paths)
+        while (
+            _delayer_allows_prefill
+            and self.waiting
+            and num_seqs_prefill < self.max_num_seqs
+        ):
             seq = self.waiting.popleft()
 
             # Drop seqs the static-capacity check at submit-time flagged as
@@ -790,10 +859,8 @@ class Scheduler:
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is
             # only published after the block's KV has actually been computed
-            # by the forward — keeps the block manager correct under future
-            # chunked-prefill scheduling where one block may span multiple
-            # steps. Must run before any seq state update so num_cached_tokens
-            # and block_table still reflect the pre-step view.
+            # by the forward. Must run before any seq state update so
+            # num_cached_tokens and block_table still reflect the pre-step view.
             if seq.type == SequenceType.PREFILL:
                 self.block_manager.hash_blocks(
                     seq, seq.num_tokens - seq.num_cached_tokens
