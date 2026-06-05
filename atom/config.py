@@ -1018,6 +1018,7 @@ class Config:
     plugin_config: Optional[PluginConfig] = None
     # only for quark_online_quantization
     online_quant_config: Optional[dict] = None
+    hf_overrides: Optional[dict[str, Any]] = None
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
@@ -1040,6 +1041,9 @@ class Config:
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        if self.hf_overrides:
+            self.hf_config.update(self.hf_overrides)
+            logger.info("Applied HF config overrides: %s", self.hf_overrides)
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -1189,6 +1193,13 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(
+            (
+                getattr(self.hf_config, "use_index_cache", False),
+                getattr(self.hf_config, "index_topk_freq", None),
+                getattr(self.hf_config, "index_topk_pattern", None),
+            )
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
