@@ -58,7 +58,11 @@ from atom.models.minimax_m3 import (
     MiniMaxM3SparseForCausalLM as NativeMiniMaxM3ForCausalLM,
 )
 from atom.models.utils import IntermediateTensors, maybe_prefix
-from atom.plugin.vllm.attention.ops import minimax_m3_sparse_attention  # noqa: F401
+from atom.plugin.vllm.attention.ops import (
+    minimax_m3_sparse_attention,
+    minimax_m3_sparse_attention_insert_kv,
+    minimax_m3_sparse_attention_preproc,
+)
 from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 from atom.plugin.vllm.models.minimax_m3_mm_preprocess import (
     MiniMaxM3VLDummyInputsBuilder,
@@ -668,24 +672,13 @@ class MiniMaxM3SparseAttention(nn.Module):
     def minimax_m3_sparse_attention_forward(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
         index_query: torch.Tensor,
-        index_key: torch.Tensor,
         kv_cache: torch.Tensor,
         index_kv_cache: torch.Tensor,
         main_meta: MiniMaxM3SparseMetadata | None,
         index_meta: MiniMaxM3SparseMetadata | None,
     ) -> torch.Tensor:
-        self._insert_kv(
-            key,
-            value,
-            index_key,
-            kv_cache,
-            index_kv_cache,
-            main_meta,
-            index_meta,
-        )
+        del index_meta
         output = torch.empty_like(query)
         output = self.impl.forward(
             self,
@@ -728,9 +721,12 @@ class MiniMaxM3SparseAttention(nn.Module):
             index_q = torch.empty(
                 (qkv.shape[0], self.index_q_size), dtype=qkv.dtype, device=qkv.device
             )
+            kv_scale = None
+            if is_quantized_kv_cache(self.kv_cache_dtype):
+                kv_scale = torch.ones((), dtype=torch.float32, device=qkv.device)
 
             cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
-            aiter.fused_minimax_m3_qknorm_rope_kv_insert(
+            torch.ops.aiter.minimax_m3_sparse_attention_preproc(
                 qkv,
                 self.q_norm.weight,
                 self.k_norm.weight,
@@ -743,31 +739,19 @@ class MiniMaxM3SparseAttention(nn.Module):
                 self.index_q_norm.weight,
                 self.index_k_norm.weight,
                 self.num_idx_heads,
-                None,
-                None,
-                None,
-                0,
+                self.kv_cache,
+                self.index_cache.kv_cache,
                 q,
                 index_q,
-                None,
+                self.layer_name,
+                self.kv_cache_dtype,
+                kv_scale,
+                kv_scale,
             )
 
-            _, k, v, _, index_k = qkv.split(
-                [
-                    self.q_size,
-                    self.kv_size,
-                    self.kv_size,
-                    self.index_q_size,
-                    self.idx_head_dim,
-                ],
-                dim=-1,
-            )
             attn_output = torch.ops.aiter.minimax_m3_sparse_attention(
                 q,
-                k,
-                v,
                 index_q,
-                index_k,
                 self.kv_cache,
                 self.index_cache.kv_cache,
                 self.layer_name,
@@ -801,12 +785,18 @@ class MiniMaxM3SparseAttention(nn.Module):
         index_k = self.index_k_norm(index_k)
         index_q, index_k = self.index_rotary_emb(positions, index_q, index_k)
 
-        attn_output = torch.ops.aiter.minimax_m3_sparse_attention(
-            q,
+        torch.ops.aiter.minimax_m3_sparse_attention_insert_kv(
             k,
             v,
-            index_q,
             index_k,
+            self.kv_cache,
+            self.index_cache.kv_cache,
+            self.layer_name,
+        )
+
+        attn_output = torch.ops.aiter.minimax_m3_sparse_attention(
+            q,
+            index_q,
             self.kv_cache,
             self.index_cache.kv_cache,
             self.layer_name,
