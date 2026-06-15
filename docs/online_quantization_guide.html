@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>EAGLE 3 / EAGLE 3.1 Speculative Decoding &mdash; ATOM 0.1.0 documentation</title>
+  <title>Online Quantization Guide &mdash; ATOM 0.1.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
@@ -540,9 +540,9 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">EAGLE 3 / EAGLE 3.1 Speculative Decoding</li>
+      <li class="breadcrumb-item active">Online Quantization Guide</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="_sources/eagle3_speculative_decoding.md.txt" rel="nofollow"> View page source</a>
+            <a href="_sources/online_quantization_guide.md.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -550,238 +550,375 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="eagle-3-eagle-3-1-speculative-decoding">
-<h1>EAGLE 3 / EAGLE 3.1 Speculative Decoding<a class="headerlink" href="#eagle-3-eagle-3-1-speculative-decoding" title="Link to this heading"></a></h1>
-<p>ATOM supports the EAGLE-family speculative decoding methods through the
-<code class="docutils literal notranslate"><span class="pre">--method</span> <span class="pre">eagle3</span></code> CLI flag. This guide covers both the original EAGLE 3 path
-(in production since the K2.5 release) and the EAGLE 3.1 extensions added
-in May 2026 (<code class="docutils literal notranslate"><span class="pre">fc_norm</span></code>, post-norm hidden state feedback, MLA draft variant).</p>
-<p>For the framework that hosts both methods, see
-<a class="reference internal" href="serving_benchmarking_guide.html"><span class="std std-doc"><code class="docutils literal notranslate"><span class="pre">serving_benchmarking_guide.md</span></code> § 6</span></a>.</p>
+  <section id="online-quantization-guide">
+<h1>Online Quantization Guide<a class="headerlink" href="#online-quantization-guide" title="Link to this heading"></a></h1>
+<p>ATOM can quantize or re-quantize model weights while loading them by passing
+<code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> to the engine. The source checkpoint stays on disk
+unchanged; quantization happens in memory inside <code class="docutils literal notranslate"><span class="pre">process_weights_after_loading</span></code>
+right after the loader finishes copying tensors.</p>
+<p>This guide covers when to use online quantization, the full configuration
+syntax, ready-to-run recipes for the most common model families, how to verify
+the result, and troubleshooting tips. For the dataclass-level field reference,
+see <a class="reference internal" href="configuration_guide.html#37-online-quantization-at-load-time"><span class="std std-ref"><code class="docutils literal notranslate"><span class="pre">configuration_guide.md</span></code> § 3.7</span></a>.</p>
 <hr class="docutils" />
-<section id="eagle-3-vs-eagle-3-1">
-<h2>1. EAGLE 3 vs EAGLE 3.1<a class="headerlink" href="#eagle-3-vs-eagle-3-1" title="Link to this heading"></a></h2>
-<p>EAGLE 3 is a self-distilled drafter that runs one transformer decoder layer
-per speculative step over the concatenation of an embedding tensor and a
-target-side hidden state. The drafter shares the target’s tokenizer and
-emits its own auxiliary projection (<code class="docutils literal notranslate"><span class="pre">fc</span></code>) over a few selected target hidden
-layers (<code class="docutils literal notranslate"><span class="pre">eagle_aux_hidden_state_layer_ids</span></code>).</p>
-<p>EAGLE 3.1 keeps the same <code class="docutils literal notranslate"><span class="pre">--method</span> <span class="pre">eagle3</span></code> code path and adds two
-backward-compatible toggles in the drafter HF config. They are detected via
-<code class="docutils literal notranslate"><span class="pre">getattr(...)</span></code> with the EAGLE 3 default, so loading an existing EAGLE 3
-checkpoint (no new fields) takes the original code path byte-for-byte.</p>
+<section id="when-to-use-online-quantization">
+<h2>1. When to use online quantization<a class="headerlink" href="#when-to-use-online-quantization" title="Link to this heading"></a></h2>
+<p>Use online quantization when one of the following holds:</p>
+<ul class="simple">
+<li><p>The model only ships an unquantized (BF16/FP16) or FP8-block checkpoint, and
+you want to evaluate a different runtime format (e.g. MXFP4 experts) without
+rebuilding the checkpoint offline.</p></li>
+<li><p>You want to sweep mixed-precision recipes (different formats for attention vs.
+MoE experts vs. shared experts) on the same source weights.</p></li>
+<li><p>You need a quick A/B between FP8 and MXFP4 on the same model without
+downloading two separate Hugging Face repos.</p></li>
+</ul>
+<p>Prefer an offline pre-quantized checkpoint (e.g. <code class="docutils literal notranslate"><span class="pre">amd/DeepSeek-R1-0528-MXFP4</span></code>)
+when one already exists for your target format — it has lower load time,
+deterministic per-layer assignment, and no online quantization overhead on
+every restart.</p>
+<section id="supported-source-checkpoint-formats">
+<h3>Supported source-checkpoint formats<a class="headerlink" href="#supported-source-checkpoint-formats" title="Link to this heading"></a></h3>
+<p>Online quantization is only activated when the source model’s <code class="docutils literal notranslate"><span class="pre">quant_method</span></code>
+is one of:</p>
 <table class="docutils align-default">
 <thead>
-<tr class="row-odd"><th class="head"><p>Field on draft <code class="docutils literal notranslate"><span class="pre">config.json</span></code></p></th>
-<th class="head"><p>Type / default</p></th>
-<th class="head"><p>Behavior when set</p></th>
+<tr class="row-odd"><th class="head"><p>Source <code class="docutils literal notranslate"><span class="pre">quant_method</span></code></p></th>
+<th class="head"><p>Behavior</p></th>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">target_hidden_size</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code>, default <code class="docutils literal notranslate"><span class="pre">hidden_size</span></code></p></td>
-<td><p>Sizes the <code class="docutils literal notranslate"><span class="pre">fc</span></code> input fan-in per aux slot. Lets the draft project from a target whose hidden dim differs from the draft’s.</p></td>
+<tr class="row-even"><td><p><em>(none, i.e. BF16/FP16 model)</em></p></td>
+<td><p>Quantized directly from float weights.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_aux_hidden_states</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code>, default <code class="docutils literal notranslate"><span class="pre">len(eagle_aux_hidden_state_layer_ids)</span></code> (else <code class="docutils literal notranslate"><span class="pre">3</span></code>)</p></td>
-<td><p>Number of target hidden-state slots concatenated into the <code class="docutils literal notranslate"><span class="pre">fc</span></code> input. Multiplies the <code class="docutils literal notranslate"><span class="pre">fc</span></code> fan-in.</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fp8</span></code> (block FP8, <code class="docutils literal notranslate"><span class="pre">QuantType.per_1x128</span></code>)</p></td>
+<td><p>FP8 block weights are dequantized to BF16 first, then re-quantized.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fc_norm</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code>, default <code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
-<td><p>When <code class="docutils literal notranslate"><span class="pre">True</span></code>, each aux slot is RMSNormed (one <code class="docutils literal notranslate"><span class="pre">RMSNorm</span></code> per slot) before concatenation and <code class="docutils literal notranslate"><span class="pre">fc</span></code>. When <code class="docutils literal notranslate"><span class="pre">False</span></code>, the legacy raw-concat path runs.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">norm_output</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">bool</span></code>, default <code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
-<td><p>When <code class="docutils literal notranslate"><span class="pre">True</span></code>, the drafter feeds its <strong>post-norm</strong> hidden state to its own next speculative step instead of the pre-norm residual. The logits path always applies the final norm once.</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mxfp4</span></code></p></td>
+<td><p><strong>Not re-quantized.</strong> Source MXFP4 weights are currently passed through unchanged — there is no dequant path for <code class="docutils literal notranslate"><span class="pre">per_1x32</span></code>, so the requested target format does not take effect on these layers.</p></td>
 </tr>
 </tbody>
 </table>
-<p>Together these target <em>attention drift</em>: under long contexts or out-of-distribution
-prompts, the drafter’s attention shifts away from the sink token as speculative
-depth grows, and acceptance length collapses. EAGLE 3.1 reports up to <strong>2×
-acceptance length on long-context production workloads</strong> and up to <strong>2.03×
-per-user output throughput at concurrency 1</strong> on Kimi-K2.6-NVFP4 + vLLM TP=4
-(GB200). See the <a class="reference external" href="https://vllm.ai/blog/2026-05-26-eagle-3-1">vLLM blog post</a>
-and the original integration in <a class="reference external" href="https://github.com/vllm-project/vllm/pull/42764">vLLM PR #42764</a>.</p>
+</section>
 </section>
 <hr class="docutils" />
-<section id="drafter-architectures">
-<h2>2. Drafter architectures<a class="headerlink" href="#drafter-architectures" title="Link to this heading"></a></h2>
-<p>ATOM ships two EAGLE 3 drafter classes, both routed through
-<code class="docutils literal notranslate"><span class="pre">atom.spec_decode.eagle.support_eagle_model_arch_dict</span></code> based on the draft
-HF config’s <code class="docutils literal notranslate"><span class="pre">architectures[0]</span></code> after <code class="docutils literal notranslate"><span class="pre">Config.hf_config_override</span></code> rewrites it
-to the internal name:</p>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p>Target stack</p></th>
-<th class="head"><p>Draft HF arch (in <code class="docutils literal notranslate"><span class="pre">config.json</span></code>)</p></th>
-<th class="head"><p>Internal class (in <code class="docutils literal notranslate"><span class="pre">support_eagle_model_arch_dict</span></code>)</p></th>
-<th class="head"><p>Source file</p></th>
-<th class="head"><p>KV cache</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>MHA / GQA (Llama-style)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLMEagle3</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Eagle3LlamaModel</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">atom/models/eagle3_llama.py</span></code></p></td>
-<td><p>Independent draft pool via <code class="docutils literal notranslate"><span class="pre">Eagle3DraftBuilder</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>MLA (DeepSeek V3 / K2.6)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Eagle3DeepseekV2ForCausalLM</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Eagle3DeepseekMLAModel</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">atom/models/eagle3_deepseek_mla.py</span></code></p></td>
-<td><p>Piggybacks the target’s MLA KV pool at <code class="docutils literal notranslate"><span class="pre">layer_id</span> <span class="pre">=</span> <span class="pre">num_hidden_layers</span></code></p></td>
-</tr>
-</tbody>
-</table>
-<p>Both classes implement the same set of EAGLE 3.1 toggles. The MLA variant
-reuses the MLA attention block from <code class="docutils literal notranslate"><span class="pre">atom/models/deepseek_v2.py</span></code> rather than
-re-implementing it. Because its KV shape is identical to the target’s, no
-parallel <code class="docutils literal notranslate"><span class="pre">Eagle3MLADraftBuilder</span></code> is needed — the draft slots into the target
-pool as one additional layer (accounted for by <code class="docutils literal notranslate"><span class="pre">num_nextn_predict_layers</span></code>).</p>
-</section>
-<hr class="docutils" />
-<section id="drafter-forward-contract">
-<h2>3. Drafter forward contract<a class="headerlink" href="#drafter-forward-contract" title="Link to this heading"></a></h2>
-<p>To support post-norm feedback, <code class="docutils literal notranslate"><span class="pre">forward()</span></code> on EAGLE 3.1 drafters returns a
-tuple:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">hidden_for_logits</span><span class="p">,</span> <span class="n">hidden_for_next_step</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">positions</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+<section id="configuration-syntax">
+<h2>2. Configuration syntax<a class="headerlink" href="#configuration-syntax" title="Link to this heading"></a></h2>
+<p>The flag accepts a single JSON object with three optional fields:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>--online_quant_config<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">  &quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;,</span>
+<span class="s1">  &quot;layer_quant_config&quot;: {&quot;*expert*&quot;: &quot;mxfp4&quot;},</span>
+<span class="s1">  &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]</span>
+<span class="s1">}&#39;</span>
 </pre></div>
 </div>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">hidden_for_logits</span></code>: pre-norm hidden state. The final <code class="docutils literal notranslate"><span class="pre">norm</span></code> + <code class="docutils literal notranslate"><span class="pre">lm_head</span></code>
-in <code class="docutils literal notranslate"><span class="pre">compute_logits()</span></code> applies on top of this, exactly as in EAGLE 3.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">hidden_for_next_step</span></code>: post-norm hidden state when <code class="docutils literal notranslate"><span class="pre">norm_output=True</span></code>,
-otherwise identical to <code class="docutils literal notranslate"><span class="pre">hidden_for_logits</span></code>. This is what the propose loop
-feeds back as <code class="docutils literal notranslate"><span class="pre">hidden_states</span></code> on the next speculative step.</p></li>
-</ul>
-<p><code class="docutils literal notranslate"><span class="pre">EagleProposer.propose()</span></code> (<code class="docutils literal notranslate"><span class="pre">atom/spec_decode/eagle.py</span></code>) unpacks the tuple via
-<code class="docutils literal notranslate"><span class="pre">isinstance(model_out,</span> <span class="pre">tuple)</span></code>, so legacy drafters returning a single tensor
-continue to work without changes.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">global_quant_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
+<td><p>Default target format applied to every Linear / MoE layer. Omit (or pass <code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code>) to leave non-matching layers at their source precision.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">layer_quant_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">dict[str,</span> <span class="pre">str]</span></code></p></td>
+<td><p>Per-layer target overrides. Keys are fnmatch-style globs such as <code class="docutils literal notranslate"><span class="pre">&quot;*expert*&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;*.mlp.gate_proj&quot;</span></code>. Matched layers override <code class="docutils literal notranslate"><span class="pre">global_quant_config</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">exclude_layer</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">str</span></code> | <code class="docutils literal notranslate"><span class="pre">list[str]</span></code></p></td>
+<td><p>Layer name patterns to leave at source precision. Supports exact match and glob (<code class="docutils literal notranslate"><span class="pre">*</span></code>). Prefer a JSON list when excluding more than one pattern.</p></td>
+</tr>
+</tbody>
+</table>
+<p>Resolution order for a given layer name:</p>
+<ol class="arabic simple">
+<li><p>If it matches <code class="docutils literal notranslate"><span class="pre">exclude_layer</span></code> → not quantized.</p></li>
+<li><p>Otherwise, first matching <code class="docutils literal notranslate"><span class="pre">layer_quant_config</span></code> pattern (in dict order).</p></li>
+<li><p>Otherwise, fall back to <code class="docutils literal notranslate"><span class="pre">global_quant_config</span></code>.</p></li>
+<li><p>If <code class="docutils literal notranslate"><span class="pre">global_quant_config</span></code> is also empty, the layer keeps its source format.</p></li>
+</ol>
+<section id="target-formats">
+<h3>2.1 Target formats<a class="headerlink" href="#target-formats" title="Link to this heading"></a></h3>
+<p>Only two target formats are currently supported. Any other string (for example
+<code class="docutils literal notranslate"><span class="pre">ptpc_i8</span></code>, <code class="docutils literal notranslate"><span class="pre">mxi4</span></code>, <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code>) will either be rejected by the JSON parser or
+trigger an assertion in the loader when the layer’s weight is quantized.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Format string</p></th>
+<th class="head"><p>Underlying <code class="docutils literal notranslate"><span class="pre">QuantType</span></code></p></th>
+<th class="head"><p>Weight dtype</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ptpc_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">QuantType.per_Token</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mxfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">QuantType.per_1x32</span></code></p></td>
+<td><p>packed FP4 (<code class="docutils literal notranslate"><span class="pre">torch.float4_e2m1fn_x2</span></code>, group size 32)</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="picking-the-right-pattern">
+<h3>2.2 Picking the right pattern<a class="headerlink" href="#picking-the-right-pattern" title="Link to this heading"></a></h3>
+<p>ATOM’s resolver runs against the <strong>fully-qualified layer name</strong> as reported by
+<code class="docutils literal notranslate"><span class="pre">model.named_modules()</span></code>. Useful patterns:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Pattern</p></th>
+<th class="head"><p>Matches</p></th>
+<th class="head"><p>Why</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;*expert*&quot;</span></code></p></td>
+<td><p>MoE expert weights (e.g. <code class="docutils literal notranslate"><span class="pre">model.layers.3.mlp.experts</span></code>)</p></td>
+<td><p>Substring match on the fused expert module.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;*.gate.*&quot;</span></code></p></td>
+<td><p>MoE router / gate Linear</p></td>
+<td><p>Always exclude — quantizing the router destroys top-k accuracy.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;lm_head&quot;</span></code></p></td>
+<td><p>Output projection</p></td>
+<td><p>Always exclude — kept at source precision avoids logit-distribution shift.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">&quot;*shared_expert*&quot;</span></code></p></td>
+<td><p>Shared experts in DeepSeek / Qwen3 MoE</p></td>
+<td><p>Keep at higher precision if you see accuracy regressions.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
 </section>
 <hr class="docutils" />
-<section id="usage">
-<h2>4. Usage<a class="headerlink" href="#usage" title="Link to this heading"></a></h2>
-<section id="k2-6-eagle-3-1-mla-draft">
-<h3>4.1 K2.6 + EAGLE 3.1 MLA draft<a class="headerlink" href="#k2-6-eagle-3-1-mla-draft" title="Link to this heading"></a></h3>
+<section id="recipes">
+<h2>3. Recipes<a class="headerlink" href="#recipes" title="Link to this heading"></a></h2>
+<p>The four recipes below are the configurations validated in
+<a class="reference external" href="https://github.com/ROCm/ATOM/pull/653">ROCm/ATOM#653</a>. Each has been A/B
+tested against its offline-quantized equivalent on gsm8k accuracy and
+ISL=1024 / OSL=1024 / concurrency=128 throughput.</p>
+<p>All commands assume you are inside the standard ATOM container
+(<code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">pull</span> <span class="pre">rocm/atom:latest</span></code>).</p>
+<section id="qwen3-30b-a3b-thinking-2507-full-per-token-fp8">
+<h3>3.1 Qwen3-30B-A3B-Thinking-2507 — full per-token FP8<a class="headerlink" href="#qwen3-30b-a3b-thinking-2507-full-per-token-fp8" title="Link to this heading"></a></h3>
+<p>BF16 source → every Linear and the fused expert module quantized to
+<code class="docutils literal notranslate"><span class="pre">ptpc_fp8</span></code>. The matching offline checkpoint is
+<code class="docutils literal notranslate"><span class="pre">amd/Qwen3-30B-A3B-Thinking-2507-ptpc</span></code>.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--model<span class="w"> </span>/path/to/Kimi-K2.6-MXFP4<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>-tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--method<span class="w"> </span>eagle3<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--num-speculative-tokens<span class="w"> </span><span class="m">3</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--draft-model<span class="w"> </span>lightseekorg/kimi-k2.6-eagle3.1-mla
+<span class="w">  </span>--model<span class="w"> </span>Qwen/Qwen3-30B-A3B-Thinking-2507<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-tp<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--online_quant_config<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;,</span>
+<span class="s1">    &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]</span>
+<span class="s1">  }&#39;</span>
 </pre></div>
 </div>
-<p>The draft <code class="docutils literal notranslate"><span class="pre">config.json</span></code> should expose <code class="docutils literal notranslate"><span class="pre">fc_norm:</span> <span class="pre">true</span></code>, <code class="docutils literal notranslate"><span class="pre">norm_output:</span> <span class="pre">true</span></code>,
-<code class="docutils literal notranslate"><span class="pre">kv_lora_rank</span></code> (signals MLA), and an
-<code class="docutils literal notranslate"><span class="pre">eagle_config.eagle_aux_hidden_state_layer_ids</span></code> list. These drive the routing
-and toggles automatically — no extra CLI flags.</p>
 </section>
-<section id="k2-5-legacy-eagle-3-draft-backward-compat">
-<h3>4.2 K2.5 + legacy EAGLE 3 draft (backward-compat)<a class="headerlink" href="#k2-5-legacy-eagle-3-draft-backward-compat" title="Link to this heading"></a></h3>
+<section id="qwen3-235b-a22b-instruct-2507-full-mxfp4">
+<h3>3.2 Qwen3-235B-A22B-Instruct-2507 — full MXFP4<a class="headerlink" href="#qwen3-235b-a22b-instruct-2507-full-mxfp4" title="Link to this heading"></a></h3>
+<p>BF16 source → every Linear (including experts) quantized to <code class="docutils literal notranslate"><span class="pre">mxfp4</span></code>, served
+with expert parallel.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--model<span class="w"> </span>/path/to/Kimi-K2.5-MXFP4<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>-tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--method<span class="w"> </span>eagle3<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--num-speculative-tokens<span class="w"> </span><span class="m">3</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--draft-model<span class="w"> </span>/path/to/kimi-k2.5-eagle3
+<span class="w">  </span>--model<span class="w"> </span>Qwen/Qwen3-235B-A22B-Instruct-2507<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-tp<span class="w"> </span><span class="m">2</span><span class="w"> </span>--enable-expert-parallel<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--online_quant_config<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;global_quant_config&quot;: &quot;mxfp4&quot;,</span>
+<span class="s1">    &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]</span>
+<span class="s1">  }&#39;</span>
 </pre></div>
 </div>
-<p>The legacy draft’s <code class="docutils literal notranslate"><span class="pre">config.json</span></code> has none of the new fields, so all <code class="docutils literal notranslate"><span class="pre">getattr</span></code>
-toggles fall through to their EAGLE 3 defaults. Behavior is byte-equivalent
-to pre-EAGLE-3.1 ATOM.</p>
+</section>
+<section id="deepseek-r1-0528-fp8-attention-mxfp4-experts">
+<h3>3.3 DeepSeek-R1-0528 — FP8 attention + MXFP4 experts<a class="headerlink" href="#deepseek-r1-0528-fp8-attention-mxfp4-experts" title="Link to this heading"></a></h3>
+<p>FP8 source → non-expert Linear stays at <code class="docutils literal notranslate"><span class="pre">ptpc_fp8</span></code>, fused MoE experts are
+downgraded to <code class="docutils literal notranslate"><span class="pre">mxfp4</span></code>. The matching offline checkpoint layout is
+<code class="docutils literal notranslate"><span class="pre">amd/DeepSeek-R1-0528-MXFP4</span></code>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-R1-0528<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--enforce-eager<span class="w"> </span>-tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--online_quant_config<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;,</span>
+<span class="s1">    &quot;layer_quant_config&quot;: {&quot;*expert*&quot;: &quot;mxfp4&quot;},</span>
+<span class="s1">    &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]</span>
+<span class="s1">  }&#39;</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--enforce-eager</span></code> mirrors the configuration used by the PR’s accuracy
+reproduction. Drop it to get full CUDA-graph throughput; it does not affect
+the online quantization output.</p>
+</section>
+<section id="deepseek-r1-0528-mtp-3-fp8-attention-mxfp4-experts">
+<h3>3.4 DeepSeek-R1-0528 + MTP-3 — FP8 attention + MXFP4 experts<a class="headerlink" href="#deepseek-r1-0528-mtp-3-fp8-attention-mxfp4-experts" title="Link to this heading"></a></h3>
+<p>Same online quantization recipe as § 3.3, layered with MTP-3 speculative
+decoding for ~2.5× lower TPOT.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.entrypoints.openai_server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-R1-0528<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--enforce-eager<span class="w"> </span>-tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--method<span class="w"> </span>mtp<span class="w"> </span>--num-speculative-tokens<span class="w"> </span><span class="m">3</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--online_quant_config<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;,</span>
+<span class="s1">    &quot;layer_quant_config&quot;: {&quot;*expert*&quot;: &quot;mxfp4&quot;},</span>
+<span class="s1">    &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]</span>
+<span class="s1">  }&#39;</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">--method</span> <span class="pre">mtp</span> <span class="pre">--num-speculative-tokens</span> <span class="pre">3</span></code> is independent of online
+quantization — it can be added to any of the recipes above without changing
+the <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> JSON.</p>
 </section>
 </section>
 <hr class="docutils" />
-<section id="runtime-acceptance-stats">
-<h2>5. Runtime acceptance stats<a class="headerlink" href="#runtime-acceptance-stats" title="Link to this heading"></a></h2>
-<p>ATOM’s scheduler already emits per-window acceptance via the <code class="docutils literal notranslate"><span class="pre">SpecStats</span></code>
-class (<code class="docutils literal notranslate"><span class="pre">atom/model_engine/scheduler.py</span></code>). With
-<code class="docutils literal notranslate"><span class="pre">num_speculative_tokens=3</span></code>, a <code class="docutils literal notranslate"><span class="pre">[MTP</span> <span class="pre">Stats]</span></code> line appears every 1000 decode
-steps in the server log:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">[</span><span class="n">MTP</span> <span class="n">Stats</span><span class="p">]</span> <span class="n">acceptance</span><span class="p">:</span> <span class="mf">59.62</span><span class="o">%</span>  <span class="n">avg</span> <span class="n">toks</span><span class="o">/</span><span class="n">fwd</span><span class="p">:</span> <span class="mf">2.79</span>  <span class="n">dist</span> <span class="mi">0</span><span class="o">/</span><span class="mi">1</span><span class="o">/</span><span class="mi">2</span><span class="o">/</span><span class="mi">3</span><span class="p">:</span> <span class="mf">21.69</span><span class="o">/</span><span class="mf">19.53</span><span class="o">/</span><span class="mf">16.97</span><span class="o">/</span><span class="mf">41.80</span><span class="o">%</span>
+<section id="plugin-mode-vllm-serve">
+<h2>3.5 Plugin mode (<code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code>)<a class="headerlink" href="#plugin-mode-vllm-serve" title="Link to this heading"></a></h2>
+<p>In the <a class="reference internal" href="vllm_plugin_backend_guide.html"><span class="std std-doc">vLLM out-of-tree plugin backend</span></a> you launch
+with <code class="docutils literal notranslate"><span class="pre">vllm</span> <span class="pre">serve</span></code>, whose CLI does not understand ATOM’s <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code>
+flag. Instead, pass the <strong>same JSON object</strong> through vLLM’s official plugin
+escape hatch <code class="docutils literal notranslate"><span class="pre">--additional-config</span></code>, under the <code class="docutils literal notranslate"><span class="pre">online_quant_config</span></code> key. ATOM
+reads it during the vLLM→ATOM config translation and routes it through the
+identical load-time quantization path (<code class="docutils literal notranslate"><span class="pre">process_weights_after_loading</span></code>),
+including the <code class="docutils literal notranslate"><span class="pre">online_quant_info_*.json</span></code> dump described in § 4.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>vllm<span class="w"> </span>serve<span class="w"> </span>deepseek-ai/DeepSeek-R1-0528<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tensor-parallel-size<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--trust-remote-code<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--no-enable-prefix-caching<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--additional-config<span class="w"> </span><span class="s1">&#39;{&quot;online_quant_config&quot;: {</span>
+<span class="s1">    &quot;global_quant_config&quot;: &quot;ptpc_fp8&quot;,</span>
+<span class="s1">    &quot;layer_quant_config&quot;: {&quot;*expert*&quot;: &quot;mxfp4&quot;},</span>
+<span class="s1">    &quot;exclude_layer&quot;: [&quot;lm_head&quot;, &quot;*.gate.*&quot;]</span>
+<span class="s1">  }}&#39;</span>
 </pre></div>
 </div>
-<p>No instrumentation needed — read these directly from the server’s stdout log
-(<code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">logs</span> <span class="pre">&lt;container&gt;</span></code> or the <code class="docutils literal notranslate"><span class="pre">tee</span></code> target you launched it under).</p>
+<p>The schema, target formats, pattern semantics, and resolution order are
+identical to the <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> flag documented in § 2. Omitting it
+leaves weights at their source precision. As with the standalone flag, online
+quantization only activates when the source checkpoint’s <code class="docutils literal notranslate"><span class="pre">quant_method</span></code> is
+unquantized or per-block FP8 (see § 1).</p>
 </section>
 <hr class="docutils" />
-<section id="reference-8-mi355x-validation">
-<h2>6. Reference: 8× MI355X validation<a class="headerlink" href="#reference-8-mi355x-validation" title="Link to this heading"></a></h2>
-<p>Measured 2026-05-27 on the <code class="docutils literal notranslate"><span class="pre">rocm/atom-dev:latest</span></code> container, TP=8, MXFP4
-targets, gsm8k 5-shot, 1319 samples.</p>
+<section id="verifying-the-result">
+<h2>4. Verifying the result<a class="headerlink" href="#verifying-the-result" title="Link to this heading"></a></h2>
+<p>When online quantization runs, rank 0 writes
+<code class="docutils literal notranslate"><span class="pre">online_quant_info_&lt;timestamp&gt;_&lt;ns&gt;.json</span></code> to:</p>
+<ol class="arabic simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">$ATOM_TORCH_PROFILER_DIR</span></code> if the env var is set, otherwise</p></li>
+<li><p>the current working directory.</p></li>
+</ol>
+<p>A representative payload:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;model&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Qwen/Qwen3-30B-A3B-Thinking-2507&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;online_quant_config&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;global_quant_config&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ptpc_fp8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;exclude_layer&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;lm_head&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;*.gate.*&quot;</span><span class="p">]</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;elapsed_seconds&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">2.343</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;num_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">144</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;layer&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;model.layers.0.self_attn.qkv_proj&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quant_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;per_Token&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quant_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;torch.float8_e4m3fn&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;layer&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;model.layers.0.mlp.experts&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quant_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;per_Token&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;quant_dtype&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;torch.float8_e4m3fn&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Things to check:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">num_layers</span></code> matches your expectation. For a Qwen3 MoE with 48 transformer
+blocks you should see <code class="docutils literal notranslate"><span class="pre">48</span> <span class="pre">×</span> <span class="pre">3</span> <span class="pre">=</span> <span class="pre">144</span></code> entries (qkv_proj + o_proj + experts).
+A drastically smaller count usually means a typo in the pattern made
+everything fall into <code class="docutils literal notranslate"><span class="pre">exclude_layer</span></code>.</p></li>
+<li><p>Per-layer <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> / <code class="docutils literal notranslate"><span class="pre">quant_dtype</span></code> reflect the format you intended for
+that pattern. The mapping is:</p>
 <table class="docutils align-default">
 <thead>
-<tr class="row-odd"><th class="head"><p>Setup</p></th>
-<th class="head"><p>gsm8k 5-shot</p></th>
-<th class="head"><p>Acceptance</p></th>
-<th class="head"><p>Avg toks/fwd</p></th>
-<th class="head"><p>Dist 0/1/2/3</p></th>
+<tr class="row-odd"><th class="head"><p>Format string</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">quant_type</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">quant_dtype</span></code></p></th>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>K2.5 MXFP4 + <code class="docutils literal notranslate"><span class="pre">kimi-k2.5-eagle3</span></code> (legacy path)</p></td>
-<td><p>0.9356 (±0.0068)</p></td>
-<td><p>67.96%</p></td>
-<td><p>3.04</p></td>
-<td><p>14.95 / 16.30 / 18.68 / 50.07%</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ptpc_fp8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">per_Token</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.float8_e4m3fn</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p>K2.6 MXFP4 + <code class="docutils literal notranslate"><span class="pre">kimi-k2.6-eagle3.1-mla</span></code></p></td>
-<td><p>0.9393 (±0.0066)</p></td>
-<td><p>59.62%</p></td>
-<td><p>2.79</p></td>
-<td><p>21.69 / 19.53 / 16.97 / 41.80%</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mxfp4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">per_1x32</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch.uint8</span></code> (packed FP4x2)</p></td>
 </tr>
 </tbody>
 </table>
-<p>The K2.5 legacy run is the backward-compat probe — it must match the
-pre-EAGLE-3.1 K2.5 baseline. The K2.6 run shows EAGLE 3.1 functional on the
-new MLA draft without regressing correctness vs. the legacy path.</p>
-<p>The lower acceptance rate on K2.6 vs K2.5 is <strong>not a regression</strong> — the two
-spec pairs are not directly comparable (different targets, different draft
-training maturity), and gsm8k is a short-context structured-reasoning task
-rather than the long-context production workload EAGLE 3.1 was designed for.
-A direct K2.6-target ablation requires an additional K2.5-style EAGLE 3
-draft sized to K2.6, which is not yet publicly available.</p>
+</li>
+<li><p><code class="docutils literal notranslate"><span class="pre">elapsed_seconds</span></code> indicates the post-loading processing time on rank 0. A
+large jump from one restart to another with the same config usually points
+to a TP gather being triggered (see § 5.2).</p></li>
+</ul>
+<p>The runtime also logs a one-line summary in the server log:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">Weight</span> <span class="n">post</span><span class="o">-</span><span class="n">processing</span> <span class="n">done</span><span class="p">:</span> <span class="mf">2.34</span> <span class="n">seconds</span><span class="p">,</span> <span class="mi">144</span> <span class="n">layers</span> <span class="n">online</span><span class="o">-</span><span class="n">quantized</span>
+<span class="n">Online</span> <span class="n">quantization</span> <span class="n">info</span> <span class="n">saved</span> <span class="n">to</span> <span class="o">/</span><span class="n">root</span><span class="o">/</span><span class="n">online_quant_info_20260525_033839_112444436</span><span class="o">.</span><span class="n">json</span>
+</pre></div>
+</div>
 </section>
 <hr class="docutils" />
-<section id="implementation-notes-for-contributors">
-<h2>7. Implementation notes for contributors<a class="headerlink" href="#implementation-notes-for-contributors" title="Link to this heading"></a></h2>
-<ul class="simple">
-<li><p><strong>Adding a new MLA target’s EAGLE 3.1 draft</strong>: register an HF arch rewrite
-in <code class="docutils literal notranslate"><span class="pre">Config.hf_config_override</span></code> (<code class="docutils literal notranslate"><span class="pre">atom/config.py</span></code>), add the entry to
-<code class="docutils literal notranslate"><span class="pre">support_eagle_model_arch_dict</span></code> (<code class="docutils literal notranslate"><span class="pre">atom/spec_decode/eagle.py</span></code>), and reuse
-<code class="docutils literal notranslate"><span class="pre">Eagle3DeepseekMLAModel</span></code> if the target’s MLA head dims match. Sizing per
-draft is automatic via the four <code class="docutils literal notranslate"><span class="pre">getattr</span></code> toggles in § 1.</p></li>
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">atom_config</span></code> copy semantics in <code class="docutils literal notranslate"><span class="pre">EagleProposer.__init__</span></code></strong>: the draft
-config is constructed by shallow-copying <code class="docutils literal notranslate"><span class="pre">atom_config</span></code> and then isolating
-<code class="docutils literal notranslate"><span class="pre">hf_config</span></code> + <code class="docutils literal notranslate"><span class="pre">compilation_config</span></code>. Avoid <code class="docutils literal notranslate"><span class="pre">copy.deepcopy(atom_config)</span></code> —
-models like K2.6 attach <code class="docutils literal notranslate"><span class="pre">cuda.Stream</span></code> objects to the config tree from
-custom HF modeling code, and <code class="docutils literal notranslate"><span class="pre">Stream</span></code> cannot be pickled.</p></li>
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">mtp_start_layer_idx</span></code> dispatch</strong> in <code class="docutils literal notranslate"><span class="pre">atom/model_engine/model_runner.py</span></code>
-branches on <code class="docutils literal notranslate"><span class="pre">speculative_config.method</span> <span class="pre">==</span> <span class="pre">&quot;eagle3&quot;</span></code>, not on the presence
-of <code class="docutils literal notranslate"><span class="pre">eagle3_draft_builder</span></code>. MLA drafts piggyback the target pool and so
-have no draft builder, but they still need the layer-index offset.</p></li>
-<li><p><strong>Do not modify <code class="docutils literal notranslate"><span class="pre">&#64;support_torch_compile</span></code>-decorated model files</strong> for
-EAGLE-related changes — instrument at call sites (<code class="docutils literal notranslate"><span class="pre">EagleProposer.propose</span></code>,
-<code class="docutils literal notranslate"><span class="pre">ModelRunner.run_model</span></code>) instead. See the project <code class="docutils literal notranslate"><span class="pre">CLAUDE.md</span></code>.</p></li>
-</ul>
+<section id="notes-and-gotchas">
+<h2>5. Notes and gotchas<a class="headerlink" href="#notes-and-gotchas" title="Link to this heading"></a></h2>
+<section id="when-online-quantization-activates">
+<h3>5.1 When online quantization activates<a class="headerlink" href="#when-online-quantization-activates" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> is only applied when the source checkpoint’s
+<code class="docutils literal notranslate"><span class="pre">quant_method</span></code> is unquantized or per-block FP8 (see § 1).</p>
 </section>
-<hr class="docutils" />
-<section id="references">
-<h2>8. References<a class="headerlink" href="#references" title="Link to this heading"></a></h2>
+<section id="tensor-parallel-behavior">
+<h3>5.2 Tensor-parallel behavior<a class="headerlink" href="#tensor-parallel-behavior" title="Link to this heading"></a></h3>
+<p>Tensor-parallel weights are gathered onto a single rank before quantization
+<strong>only</strong> when local quantization would produce different scales than quantizing
+the full unpartitioned weight. Concretely:</p>
 <ul class="simple">
-<li><p>vLLM integration PR (merged main, ships v0.22.0): https://github.com/vllm-project/vllm/pull/42764</p></li>
-<li><p>TorchSpec training PR: https://github.com/lightseekorg/TorchSpec/pull/97</p></li>
-<li><p>vLLM blog: https://vllm.ai/blog/2026-05-26-eagle-3-1</p></li>
-<li><p>Kimi K2.6 EAGLE 3.1 draft model: https://huggingface.co/lightseekorg/kimi-k2.6-eagle3.1-mla</p></li>
-<li><p>Original EAGLE repository: https://github.com/SafeAILab/EAGLE</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ptpc_fp8</span></code> (<code class="docutils literal notranslate"><span class="pre">per_Token</span></code>): scales are per output channel and the channel
+dimension is exactly what TP shards on, so quantization is done locally with
+no gather.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mxfp4</span></code> (<code class="docutils literal notranslate"><span class="pre">per_1x32</span></code>): scales are within 32-element blocks along the input
+dimension; for <code class="docutils literal notranslate"><span class="pre">RowParallelLinear</span></code> this requires a gather on the input dim
+before quantization, then re-sharding. This is the most expensive case.</p></li>
 </ul>
+<p>If load time grows linearly with TP size, your recipe is hitting the gather
+path.</p>
+</section>
+<section id="only-linear-and-fused-moe-modules-are-quantized">
+<h3>5.3 Only Linear and fused MoE modules are quantized<a class="headerlink" href="#only-linear-and-fused-moe-modules-are-quantized" title="Link to this heading"></a></h3>
+<p>Modules whose weights are not loaded through ATOM’s <code class="docutils literal notranslate"><span class="pre">LinearMethodBase</span></code> or
+<code class="docutils literal notranslate"><span class="pre">FusedMoEMethodBase</span></code> paths are skipped silently. In practice this means
+embeddings, layernorms, attention bias, and any custom op kept in BF16 will not
+appear in <code class="docutils literal notranslate"><span class="pre">online_quant_info_*.json</span></code> — that is expected.</p>
+</section>
+<section id="compile-cache">
+<h3>5.4 Compile cache<a class="headerlink" href="#compile-cache" title="Link to this heading"></a></h3>
+<p>The compile cache (<code class="docutils literal notranslate"><span class="pre">/root/.cache/atom/*</span></code>) is keyed on the full quantization
+config hash. Switching <code class="docutils literal notranslate"><span class="pre">--online_quant_config</span></code> between runs will trigger a
+recompile on first startup. If you are iterating rapidly:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>/root/.cache/atom/*
+</pre></div>
+</div>
+</section>
+<section id="always-exclude-the-moe-gate">
+<h3>5.5 Always exclude the MoE gate<a class="headerlink" href="#always-exclude-the-moe-gate" title="Link to this heading"></a></h3>
+<p>The MoE router (<code class="docutils literal notranslate"><span class="pre">*.gate.*</span></code>) is a tiny Linear that produces top-k routing
+logits. Quantizing it consistently produces large accuracy drops on every MoE
+model we have measured. Keep it in the exclude list unless you have a specific
+reason not to.</p>
+<hr class="docutils" />
+</section>
 </section>
 </section>
 
