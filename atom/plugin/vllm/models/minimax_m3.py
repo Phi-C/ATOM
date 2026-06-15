@@ -11,7 +11,8 @@ ATOM-owned modules.
 from collections.abc import Iterable
 
 import torch
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter import ActivationType
+from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
@@ -48,7 +49,7 @@ from atom.model_ops.minimax_m3.gemma_rmsnorm import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
 )
-from atom.model_ops.minimax_m3.moe import MiniMaxM3Bf16Experts
+from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models import minimax_m3 as minimax_m3_base
@@ -708,10 +709,10 @@ class MiniMaxM3MoE(nn.Module):
     ) -> None:
         super().__init__()
         del layer_id
-        self.tp_size = get_tensor_model_parallel_world_size()
-        if self.tp_size > config.num_local_experts:
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > config.num_local_experts:
             raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
+                f"Tensor parallel size {tp_size} is greater than "
                 f"the number of experts {config.num_local_experts}."
             )
 
@@ -733,8 +734,30 @@ class MiniMaxM3MoE(nn.Module):
         self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
         self.gate.weight.weight_loader_process = old_wlp
 
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.experts = FusedMoE(
+            num_experts=config.num_local_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            params_dtype=params_dtype,
+            reduce_results=False,
+            renormalize=True,
+            activation=ActivationType.Swiglu,
+            scoring_func=getattr(config, "scoring_func", "sigmoid"),
+            e_score_correction_bias=self.e_score_correction_bias,
+            quant_config=expert_quant_config,
+            prefix=f"{prefix}.experts",
+            config=config,
+            shared_expert_prefix=f"{prefix}.shared_experts",
+        )
+        self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        self.fuse_shared_experts = (
+            getattr(self.experts, "num_fused_shared_experts", 0) > 0
+        )
+
         self.shared_experts: MiniMaxM3MLP | None = None
-        if getattr(config, "n_shared_experts", 0):
+        if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.intermediate_size * config.n_shared_experts,
@@ -743,21 +766,6 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        self.experts = MiniMaxM3Bf16Experts(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            scoring_func=getattr(config, "scoring_func", "sigmoid"),
-            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-            swiglu_alpha=getattr(config, "swiglu_alpha", 1.702),
-            swiglu_beta=getattr(config, "swiglu_beta", 1.0),
-            swiglu_limit=getattr(config, "swiglu_limit", 7.0),
-            quant_config=expert_quant_config,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.experts",
-        )
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
@@ -765,16 +773,15 @@ class MiniMaxM3MoE(nn.Module):
             hidden_states.float(), self.gate.weight.float()
         )
         routed_output = self.experts(
-            hidden_states,
-            router_logits,
-            self.e_score_correction_bias,
+            hidden_states=hidden_states,
+            router_logits=router_logits,
         )
+        if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
+            routed_output = routed_output * self.routed_scaling_factor
 
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
 
-        if self.tp_size > 1:
-            routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output.view(orig_shape)
 
 
@@ -820,6 +827,7 @@ class MiniMaxM3DecoderLayer(minimax_m3_base.MiniMaxM3DecoderLayer):
                 config=config,
                 intermediate_size=config.dense_intermediate_size,
                 quant_config=vllm_quant_config,
+                reduce_results=False,
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = MiniMAXGemmaRMSNorm(
@@ -839,7 +847,9 @@ class MiniMaxM3DecoderLayer(minimax_m3_base.MiniMaxM3DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
@@ -868,6 +878,46 @@ class MiniMaxM3SparseForCausalLM(NativeMiniMaxM3ForCausalLM):
             prefix=prefix,
             layer_type=layer_type,
         )
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        num_fused_shared = getattr(self.config, "n_shared_experts", 0) or 0
+        return minimax_m3_base.make_minimax_m3_expert_params_mapping(
+            self.config.num_local_experts + num_fused_shared
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        model = self.model
+        if get_pp_group().is_first_rank:
+            hidden_states = (
+                inputs_embeds
+                if inputs_embeds is not None
+                else model.get_input_embeddings(input_ids)
+            )
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+
+        for layer in model.layers[model.start_layer : model.end_layer]:
+            hidden_states, residual = layer(positions, hidden_states, residual)
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+
+        hidden_states, _ = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, model.norm
+        )
+        return hidden_states
 
 
 @MULTIMODAL_REGISTRY.register_processor(

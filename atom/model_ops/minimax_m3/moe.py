@@ -180,33 +180,34 @@ def make_minimax_m3_expert_params_mapping(
     """Return loader mapping for MiniMax-M3 split expert checkpoint weights."""
     mapping: list[tuple[str, str, int, str]] = []
     for expert_id in range(num_experts):
-        for shard_id, weight_name in (
-            ("w1", "w1"),
-            ("w2", "w2"),
-            ("w3", "w3"),
+        for shard_id, weight_names in (
+            ("w1", ("w1", "gate_proj")),
+            ("w2", ("w2", "down_proj")),
+            ("w3", ("w3", "up_proj")),
         ):
-            if weight_name in ("w1", "w3"):
+            if shard_id in ("w1", "w3"):
                 param_prefix = "experts.w13_"
                 scale_param = "experts.w13_weight_scale"
             else:
                 param_prefix = "experts.w2_"
                 scale_param = "experts.w2_weight_scale"
-            mapping.append(
-                (
-                    scale_param,
-                    f"experts.{expert_id}.{weight_name}.scale",
-                    expert_id,
-                    shard_id,
+            for weight_name in weight_names:
+                mapping.append(
+                    (
+                        scale_param,
+                        f"experts.{expert_id}.{weight_name}.scale",
+                        expert_id,
+                        shard_id,
+                    )
                 )
-            )
-            mapping.append(
-                (
-                    param_prefix,
-                    f"experts.{expert_id}.{weight_name}.",
-                    expert_id,
-                    shard_id,
+                mapping.append(
+                    (
+                        param_prefix,
+                        f"experts.{expert_id}.{weight_name}.",
+                        expert_id,
+                        shard_id,
+                    )
                 )
-            )
     return mapping
 
 
@@ -294,11 +295,7 @@ class MiniMaxM3Bf16Experts(nn.Module):
         compilation_config.static_forward_context[prefix] = self
 
         self.params_dtype = params_dtype or layer_quant_config.quant_dtype
-        dtype = (
-            self.quant_dtype
-            if self.is_quantized
-            else self.params_dtype
-        )
+        dtype = self.quant_dtype if self.is_quantized else self.params_dtype
         self.w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
