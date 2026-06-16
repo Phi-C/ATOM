@@ -11,25 +11,41 @@ imported here.
 from typing import Optional, Union
 
 import torch
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+import aiter
+from aiter import ActivationType
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import GemmaRMSNorm, fused_allreduce_gemma_rms_norm
+from atom.model_ops.layernorm import fused_allreduce_gemma_rms_norm
 from atom.model_ops.linear import (
+    MinimaxM3QKVParallelLinearWithIndexer,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
+from atom.model_ops.moe import FusedMoE
+from atom.model_ops.minimax_m3.index_topk import (
+    minimax_m3_index_topk,
+    minimax_m3_index_topk_decode,
+)
+from atom.model_ops.minimax_m3.gemma_rmsnorm import (
+    gemma_fused_add_rmsnorm,
+    gemma_rmsnorm,
+    gemma_rmsnorm_heads,
+)
 from atom.model_ops.minimax_m3.moe import (
-    MiniMaxM3Bf16Experts,
     make_minimax_m3_expert_params_mapping,
+)
+from atom.model_ops.minimax_m3.sparse_attn import (
+    SPARSE_BLOCK_SIZE,
+    minimax_m3_sparse_attn,
+    minimax_m3_sparse_attn_decode,
 )
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
@@ -41,6 +57,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -68,6 +85,57 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
 
 def _rope_theta(config: PretrainedConfig) -> float:
     return getattr(config, "rope_theta", 1000000.0)
+
+
+def _can_use_fused_minimax_m3_attention_preproc(
+    qkv: torch.Tensor,
+    rotary_emb: nn.Module,
+    *weights: torch.Tensor,
+) -> bool:
+    return (
+        hasattr(aiter, "fused_minimax_m3_qknorm_rope_kv_insert")
+        and qkv.dim() == 2
+        and qkv.is_cuda
+        and qkv.dtype in (torch.float16, torch.bfloat16)
+        and getattr(rotary_emb, "head_size", None) == 128
+        and getattr(rotary_emb, "rotary_dim", 0) > 0
+        and getattr(rotary_emb, "is_neox_style", False)
+        and all(weight.dtype == qkv.dtype for weight in weights)
+    )
+
+
+def _minimax_m3_cos_sin_cache(
+    rotary_emb: nn.Module,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    cos_cache = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+    sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+    if cos_cache.dtype != dtype:
+        cos_cache = cos_cache.to(dtype=dtype)
+        sin_cache = sin_cache.to(dtype=dtype)
+    return torch.cat([cos_cache, sin_cache], dim=-1)
+
+
+class MiniMAXGemmaRMSNorm(nn.Module):
+    """MiniMax-M3 Gemma-style RMSNorm, matching the vLLM-ATOM wrapper."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return gemma_rmsnorm(x, self.weight, self.variance_epsilon)
+        return gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
 
 
 class MiniMaxM3MLP(nn.Module):
@@ -100,9 +168,9 @@ class MiniMaxM3MLP(nn.Module):
                 f"Unsupported MiniMax-M3 activation {config.hidden_act!r}; "
                 "expected 'swigluoai'."
             )
-        self.swiglu_alpha = config.swiglu_alpha
-        self.swiglu_beta = config.swiglu_beta
-        self.swiglu_limit = config.swiglu_limit
+        self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
+        self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
+        self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
@@ -116,11 +184,7 @@ class MiniMaxM3MLP(nn.Module):
 
 
 class MiniMaxM3MoE(nn.Module):
-    """MiniMax-M3 routed MoE.
-
-    Uses a MiniMax-M3-owned expert implementation instead of ATOM's generic
-    ``FusedMoE`` so the model path does not depend on vLLM's MoE stack.
-    """
+    """MiniMax-M3 routed MoE aligned with the vLLM-ATOM FusedMoE path."""
 
     def __init__(
         self,
@@ -132,10 +196,10 @@ class MiniMaxM3MoE(nn.Module):
     ) -> None:
         super().__init__()
         del layer_id
-        self.tp_size = get_tensor_model_parallel_world_size()
-        if self.tp_size > config.num_local_experts:
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size > config.num_local_experts:
             raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
+                f"Tensor parallel size {tp_size} is greater than "
                 f"the number of experts {config.num_local_experts}."
             )
 
@@ -158,8 +222,30 @@ class MiniMaxM3MoE(nn.Module):
         self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
         self.gate.weight.weight_loader_process = old_wlp
 
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.experts = FusedMoE(
+            num_experts=config.num_local_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            params_dtype=params_dtype,
+            reduce_results=False,
+            renormalize=True,
+            activation=ActivationType.Swiglu,
+            scoring_func=getattr(config, "scoring_func", "sigmoid"),
+            e_score_correction_bias=self.e_score_correction_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+            config=config,
+            shared_expert_prefix=f"{prefix}.shared_experts",
+        )
+        self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        self.fuse_shared_experts = (
+            getattr(self.experts, "num_fused_shared_experts", 0) > 0
+        )
+
         self.shared_experts: MiniMaxM3MLP | None = None
-        if getattr(config, "n_shared_experts", 0):
+        if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.intermediate_size * config.n_shared_experts,
@@ -168,21 +254,6 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        self.experts = MiniMaxM3Bf16Experts(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            scoring_func=getattr(config, "scoring_func", "sigmoid"),
-            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-            swiglu_alpha=getattr(config, "swiglu_alpha", 1.702),
-            swiglu_beta=getattr(config, "swiglu_beta", 1.0),
-            swiglu_limit=getattr(config, "swiglu_limit", 7.0),
-            quant_config=quant_config,
-            params_dtype=params_dtype,
-            prefix=f"{prefix}.experts",
-        )
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
@@ -190,16 +261,15 @@ class MiniMaxM3MoE(nn.Module):
             hidden_states.float(), self.gate.weight.float()
         )
         routed_output = self.experts(
-            hidden_states,
-            router_logits,
-            self.e_score_correction_bias,
+            hidden_states=hidden_states,
+            router_logits=router_logits,
         )
+        if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
+            routed_output = routed_output * self.routed_scaling_factor
 
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
 
-        if self.tp_size > 1:
-            routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output.view(orig_shape)
 
 
@@ -241,8 +311,8 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary_dim = int(self.head_dim * getattr(config, "partial_rotary_factor", 1.0))
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -260,17 +330,26 @@ class MiniMaxM3Attention(nn.Module):
             layer_num=layer_id,
             use_mla=False,
             rotary_emb=None,
+            force_triton_attn=True,
             prefix=f"{prefix}.attn",
         )
 
     def _qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q = self.q_norm(q.view(*q.shape[:-1], self.num_heads, self.head_dim)).view(
-            q.shape
+        q = gemma_rmsnorm_heads(
+            q,
+            self.num_heads,
+            self.head_dim,
+            self.q_norm.weight,
+            self.q_norm.variance_epsilon,
         )
-        k = self.k_norm(k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)).view(
-            k.shape
+        k = gemma_rmsnorm_heads(
+            k,
+            self.num_kv_heads,
+            self.head_dim,
+            self.k_norm.weight,
+            self.k_norm.variance_epsilon,
         )
         return self.rotary_emb(positions, q, k)
 
@@ -280,6 +359,39 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
+        if _can_use_fused_minimax_m3_attention_preproc(
+            qkv, self.rotary_emb, self.q_norm.weight, self.k_norm.weight
+        ):
+            qkv = qkv.contiguous()
+            q = torch.empty(
+                (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
+            )
+            cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv.dtype)
+            aiter.fused_minimax_m3_qknorm_rope_kv_insert(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+                None,
+                None,
+                0,
+                None,
+                None,
+                None,
+                0,
+                q,
+                None,
+                None,
+            )
+            _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn(q, k, v)
+            return self.o_proj(attn_output)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._qk_norm_rope(positions, q, k)
         attn_output = self.attn(q, k, v)
@@ -287,11 +399,7 @@ class MiniMaxM3Attention(nn.Module):
 
 
 class MiniMaxM3SparseAttention(nn.Module):
-    """Native ATOM sparse attention placeholder.
-
-    MiniMax-M3 sparse attention needs a native ATOM metadata/backend port.  The
-    vLLM plugin implementation lives in ``atom.plugin.vllm.models.minimax_m3``.
-    """
+    """Native ATOM MiniMax-M3 lightning-indexer sparse attention."""
 
     def __init__(
         self,
@@ -302,20 +410,332 @@ class MiniMaxM3SparseAttention(nn.Module):
         cache_config: str = "bf16",
     ) -> None:
         super().__init__()
-        del config, layer_id, quant_config, prefix, cache_config
-        raise NotImplementedError(
-            "MiniMax-M3 native sparse attention is not implemented in ATOM yet. "
-            "Use the vLLM plugin implementation or port a native ATOM sparse "
-            "metadata/backend first."
+        self.is_minimax_m3_sparse_attention = True
+        self.hidden_size = config.hidden_size
+        self.layer_num = layer_id
+        self.layer_name = f"{prefix}.attn"
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = config.num_attention_heads
+        if self.total_num_heads % self.tp_size != 0:
+            raise ValueError("num_attention_heads must be divisible by TP size.")
+        self.num_heads = self.total_num_heads // self.tp_size
+        self.total_num_kv_heads = config.num_key_value_heads
+        if self.total_num_kv_heads >= self.tp_size:
+            if self.total_num_kv_heads % self.tp_size != 0:
+                raise ValueError("num_key_value_heads must divide TP size.")
+        elif self.tp_size % self.total_num_kv_heads != 0:
+            raise ValueError("TP size must divide num_key_value_heads replication.")
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+        self.head_dim = config.head_dim
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.kv_cache_dtype = cache_config
+
+        sparse_cfg = config.sparse_attention_config
+        sparse_block_size = sparse_cfg["sparse_block_size"]
+        if sparse_block_size != SPARSE_BLOCK_SIZE:
+            raise ValueError(
+                "MiniMax-M3 native sparse attention requires sparse_block_size "
+                f"{SPARSE_BLOCK_SIZE}, got {sparse_block_size}."
+            )
+        self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
+        self.num_idx_heads = self.num_kv_heads
+        self.idx_head_dim = sparse_cfg["sparse_index_dim"]
+        self.index_q_size = self.num_idx_heads * self.idx_head_dim
+        self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
+        self.init_blocks = sparse_cfg.get("sparse_init_block", 0)
+        self.local_blocks = sparse_cfg.get("sparse_local_block", 0)
+        score_type = sparse_cfg.get("sparse_score_type", "max")
+        if score_type != "max":
+            raise ValueError(
+                "MiniMax-M3 native sparse attention only supports "
+                f"sparse_score_type='max', got {score_type!r}."
+            )
+
+        self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.total_idx_heads,
+            self.idx_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            reduce_results=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        rotary_dim = int(self.head_dim * getattr(config, "partial_rotary_factor", 1.0))
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=rotary_dim,
+            max_position=config.max_position_embeddings,
+            base=_rope_theta(config),
+            rope_scaling=getattr(config, "rope_scaling", None),
+        )
+        self.index_q_norm = MiniMAXGemmaRMSNorm(
+            self.idx_head_dim, eps=config.rms_norm_eps
+        )
+        self.index_k_norm = MiniMAXGemmaRMSNorm(
+            self.idx_head_dim, eps=config.rms_norm_eps
+        )
+        self.index_rotary_emb = self.rotary_emb
+        self.kv_cache = torch.tensor([])
+        self.index_cache = torch.tensor([])
+        compilation_config = get_current_atom_config().compilation_config
+        if self.layer_name in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer: {self.layer_name}")
+        compilation_config.static_forward_context[self.layer_name] = self
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        del positions, hidden_states
-        raise NotImplementedError
+        qkv = self.qkv_proj(hidden_states)
+        attn_output = torch.ops.aiter.minimax_m3_sparse_attention_native(
+            qkv,
+            positions,
+            self.layer_name,
+            self.q_size,
+        )
+        return self.o_proj(attn_output)
+
+    def _insert_kv(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index_k: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if self.kv_cache.numel() == 0 or self.index_cache.numel() == 0:
+            return
+        key_cache, value_cache = self.kv_cache.unbind(1)
+        kv_cache_dtype = "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+        aiter.reshape_and_cache(
+            k.view(-1, self.num_kv_heads, self.head_dim),
+            v.view(-1, self.num_kv_heads, self.head_dim),
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=None,
+            v_scale=None,
+            asm_layout=False,
+        )
+        self.index_cache.view(-1, self.idx_head_dim)[slot_mapping] = index_k.to(
+            self.index_cache.dtype
+        )
+
+    def _prefix_lens(self, cu_seqlens_q: torch.Tensor, seq_lens: torch.Tensor):
+        query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        return seq_lens - query_lens
+
+    def _run_prefill_sparse(
+        self,
+        q: torch.Tensor,
+        index_q: torch.Tensor,
+        sparse_metadata,
+    ) -> torch.Tensor:
+        prefill_metadata = sparse_metadata.prefill
+        assert prefill_metadata is not None
+        cu_seqlens_q = prefill_metadata.cu_seqlens_q
+        seq_lens = prefill_metadata.seq_lens
+        prefix_lens = prefill_metadata.context_lens
+        block_tables = prefill_metadata.block_table
+        topk_idx = minimax_m3_index_topk(
+            index_q,
+            self.index_cache,
+            block_tables,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            prefill_metadata.max_query_len,
+            prefill_metadata.max_seq_len,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            self.num_kv_heads,
+            self.scaling,
+        )
+        output = torch.empty_like(q)
+        minimax_m3_sparse_attn(
+            q,
+            self.kv_cache,
+            topk_idx,
+            block_tables,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            prefill_metadata.max_query_len,
+            self.num_kv_heads,
+            self.scaling,
+            output,
+        )
+        return output
+
+    def _run_decode_sparse(
+        self,
+        q: torch.Tensor,
+        index_q: torch.Tensor,
+        sparse_metadata,
+    ) -> torch.Tensor:
+        decode_metadata = sparse_metadata.decode
+        assert decode_metadata is not None
+        topk_idx = minimax_m3_index_topk_decode(
+            index_q,
+            self.index_cache,
+            decode_metadata.block_table,
+            decode_metadata.seq_lens,
+            sparse_metadata.max_seq_len,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            self.num_kv_heads,
+            self.scaling,
+        )
+        output = torch.empty_like(q)
+        minimax_m3_sparse_attn_decode(
+            q,
+            self.kv_cache,
+            topk_idx,
+            decode_metadata.block_table,
+            decode_metadata.seq_lens,
+            self.num_kv_heads,
+            self.scaling,
+            output,
+        )
+        return output
+
+    def sparse_attention_forward_impl(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        fwd_ctx = get_forward_context()
+        if (
+            fwd_ctx.context.is_dummy_run
+            or fwd_ctx.attn_metadata is None
+            or self.kv_cache.numel() == 0
+            or self.index_cache.numel() == 0
+        ):
+            return torch.empty(
+                (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
+            )
+
+        attn_metadata = fwd_ctx.attn_metadata
+        sparse_metadata = getattr(attn_metadata, "minimax_m3_sparse_metadata", None)
+        if sparse_metadata is None:
+            sparse_metadata = attn_metadata
+        if _can_use_fused_minimax_m3_attention_preproc(
+            qkv,
+            self.rotary_emb,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+        ):
+            qkv = qkv.contiguous()
+            q = torch.empty(
+                (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
+            )
+            index_q = torch.empty(
+                (qkv.shape[0], self.index_q_size), dtype=qkv.dtype, device=qkv.device
+            )
+            cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv.dtype)
+            aiter.fused_minimax_m3_qknorm_rope_kv_insert(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+                self.index_q_norm.weight,
+                self.index_k_norm.weight,
+                self.num_idx_heads,
+                sparse_metadata.slot_mapping,
+                self.kv_cache,
+                self.index_cache,
+                self.kv_cache.shape[2],
+                q,
+                index_q,
+                sparse_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                None,
+                None,
+            )
+            q = q.view(-1, self.num_heads, self.head_dim)
+            index_q = index_q.view(-1, self.num_idx_heads, self.idx_head_dim)
+            if getattr(sparse_metadata, "num_prefills", 0) > 0:
+                output = self._run_prefill_sparse(q, index_q, sparse_metadata)
+            else:
+                output = self._run_decode_sparse(q, index_q, sparse_metadata)
+            return output.view(-1, self.q_size)
+
+        q, k, v, index_q, index_k = qkv.split(
+            [
+                self.q_size,
+                self.kv_size,
+                self.kv_size,
+                self.index_q_size,
+                self.idx_head_dim,
+            ],
+            dim=-1,
+        )
+        q = gemma_rmsnorm_heads(
+            q,
+            self.num_heads,
+            self.head_dim,
+            self.q_norm.weight,
+            self.q_norm.variance_epsilon,
+        )
+        k = gemma_rmsnorm_heads(
+            k,
+            self.num_kv_heads,
+            self.head_dim,
+            self.k_norm.weight,
+            self.k_norm.variance_epsilon,
+        )
+        q, k = self.rotary_emb(positions, q, k)
+
+        index_q = gemma_rmsnorm_heads(
+            index_q,
+            self.num_idx_heads,
+            self.idx_head_dim,
+            self.index_q_norm.weight,
+            self.index_q_norm.variance_epsilon,
+        )
+        index_k = gemma_rmsnorm_heads(
+            index_k,
+            1,
+            self.idx_head_dim,
+            self.index_k_norm.weight,
+            self.index_k_norm.variance_epsilon,
+        )
+        index_q, index_k = self.index_rotary_emb(positions, index_q, index_k)
+
+        self._insert_kv(k, v, index_k, sparse_metadata.slot_mapping)
+
+        q = q.view(-1, self.num_heads, self.head_dim)
+        index_q = index_q.view(-1, self.num_idx_heads, self.idx_head_dim)
+        if getattr(sparse_metadata, "num_prefills", 0) > 0:
+            output = self._run_prefill_sparse(q, index_q, sparse_metadata)
+        else:
+            output = self._run_decode_sparse(q, index_q, sparse_metadata)
+        return output.view(-1, self.q_size)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -356,11 +776,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config=config,
                 intermediate_size=config.dense_intermediate_size,
                 quant_config=quant_config,
+                reduce_results=False,
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        self.input_layernorm = MiniMAXGemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = MiniMAXGemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -374,7 +797,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
@@ -422,7 +847,7 @@ class MiniMaxM3Model(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
-            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -460,11 +885,16 @@ class MiniMaxM3Model(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, self.norm
+        )
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return make_minimax_m3_expert_params_mapping(self.config.num_local_experts)
+        num_fused_shared = getattr(self.config, "n_shared_experts", 0) or 0
+        return make_minimax_m3_expert_params_mapping(
+            self.config.num_local_experts + num_fused_shared
+        )
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):

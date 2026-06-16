@@ -696,6 +696,64 @@ def get_generation_config(model: str) -> GenerationConfig:
         return None
 
 
+def _mirror_text_config_fields(hf_config: PretrainedConfig) -> None:
+    """Expose text-backbone fields on multimodal root configs when missing.
+
+    Several native ATOM subsystems predate multimodal root configs and still
+    read structural LLM fields from ``hf_config`` directly. MiniMax-M3 keeps
+    those fields under ``text_config``; mirror only missing attributes so real
+    root-level values, if present, keep precedence.
+    """
+
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None or text_config is hf_config:
+        return
+
+    fields = (
+        "vocab_size",
+        "hidden_size",
+        "intermediate_size",
+        "dense_intermediate_size",
+        "shared_intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "max_position_embeddings",
+        "rms_norm_eps",
+        "rope_theta",
+        "rotary_dim",
+        "partial_rotary_factor",
+        "rope_scaling",
+        "rope_parameters",
+        "hidden_act",
+        "swiglu_alpha",
+        "swiglu_beta",
+        "swiglu_limit",
+        "num_local_experts",
+        "num_experts_per_tok",
+        "n_shared_experts",
+        "scoring_func",
+        "use_routing_bias",
+        "routed_scaling_factor",
+        "moe_layer_freq",
+        "sparse_attention_config",
+        "tie_word_embeddings",
+        "quantization_config",
+    )
+    for attr_name in fields:
+        if not hasattr(hf_config, attr_name) and hasattr(text_config, attr_name):
+            setattr(hf_config, attr_name, getattr(text_config, attr_name))
+
+    # MiniMax-M3 checkpoints omit swiglu_beta, while the reference/vLLM-ATOM
+    # config defines SwiGLU-OAI as beta=1.0, i.e. (up + 1).
+    if getattr(text_config, "hidden_act", None) == "swigluoai":
+        if getattr(text_config, "swiglu_beta", None) is None:
+            text_config.swiglu_beta = 1.0
+        if getattr(hf_config, "swiglu_beta", None) is None:
+            hf_config.swiglu_beta = text_config.swiglu_beta
+
+
 @dataclass
 class ParallelConfig:
     data_parallel_size: int = 1
@@ -1052,6 +1110,7 @@ class Config:
         if self.hf_overrides:
             self.hf_config.update(self.hf_overrides)
             logger.info("Applied HF config overrides: %s", self.hf_overrides)
+        _mirror_text_config_fields(self.hf_config)
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)

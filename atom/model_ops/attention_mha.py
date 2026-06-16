@@ -52,6 +52,7 @@ class PagedAttentionImpl(nn.Module):
         rotary_emb: Optional[torch.nn.Module] = None,
         q_norm: Optional[torch.nn.Module] = None,
         k_norm: Optional[torch.nn.Module] = None,
+        force_triton_attn: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -80,6 +81,7 @@ class PagedAttentionImpl(nn.Module):
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
+        self.force_triton_attn = force_triton_attn
         # Set by the attention backend's build_kv_cache_tensor when KV cache is
         # allocated in flash layout [num_blocks, block_size, num_kv_heads, head_dim]
         # for aiter triton unified_attention. AiterBackend keeps this False.
@@ -190,7 +192,8 @@ class PagedAttentionImpl(nn.Module):
 
         # MTP MHA must go through triton/gluon; aiter ASM non-persistent path may have some unexpected behavior.
         use_triton_attn = (
-            self.sliding_window != -1
+            self.force_triton_attn
+            or self.sliding_window != -1
             or self.head_dim != 128
             or self.num_heads == self.num_kv_heads
         )

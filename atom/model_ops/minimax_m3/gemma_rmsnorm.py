@@ -21,7 +21,11 @@ contiguous.
 
 import torch
 
-from vllm.triton_utils import tl, triton
+try:
+    from vllm.triton_utils import tl, triton
+except ModuleNotFoundError:
+    import triton
+    import triton.language as tl
 
 
 @triton.jit
@@ -50,6 +54,32 @@ def _gemma_rmsnorm_kernel(
         out.to(out_ptr.dtype.element_ty),
         mask=mask,
     )
+
+
+@triton.jit
+def _gemma_rmsnorm_heads_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    stride_x_row,
+    stride_x_col,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    eps,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < head_dim
+    x_offsets = token * stride_x_row + (head * head_dim + cols) * stride_x_col
+    x = tl.load(x_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / head_dim
+    rstd = 1.0 / tl.sqrt(var + eps)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    out = x * rstd * (1.0 + w)
+    out_offsets = token * (num_heads * head_dim) + head * head_dim + cols
+    tl.store(out_ptr + out_offsets, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -121,6 +151,37 @@ def gemma_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
         num_warps=_num_warps(block_n),
     )
     return out.reshape(orig_shape)
+
+
+def gemma_rmsnorm_heads(
+    x: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Per-head Gemma RMSNorm for packed QKV slices without input copies."""
+
+    if x.ndim != 2 or x.shape[-1] != num_heads * head_dim:
+        raise ValueError(
+            "gemma_rmsnorm_heads expects x shape "
+            f"[tokens, {num_heads * head_dim}], got {tuple(x.shape)}."
+        )
+    out = torch.empty((x.shape[0], num_heads * head_dim), dtype=x.dtype, device=x.device)
+    block_n = triton.next_power_of_2(head_dim)
+    _gemma_rmsnorm_heads_kernel[(x.shape[0], num_heads)](
+        x,
+        weight,
+        out,
+        x.stride(0),
+        x.stride(1),
+        num_heads,
+        head_dim,
+        eps,
+        BLOCK_N=block_n,
+        num_warps=_num_warps(block_n),
+    )
+    return out
 
 
 def gemma_fused_add_rmsnorm(
