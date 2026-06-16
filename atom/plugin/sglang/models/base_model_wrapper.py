@@ -39,6 +39,23 @@ __all__ = [
 ]
 
 
+class _AtomLMHeadForSGLang(nn.Module):
+    """Adapter that makes SGLang call ATOM's lm_head.forward()."""
+
+    def __init__(self, lm_head) -> None:
+        super().__init__()
+        self.lm_head = lm_head
+
+    def set_lora(self, *args, **kwargs):
+        return None
+
+    def apply_lora(self, *args, **kwargs):
+        return None
+
+    def forward(self, hidden_states):
+        return self.lm_head(hidden_states)
+
+
 class _AtomCausalLMBaseForSglang(nn.Module):
     """Base ATOM model wrapper conforming to sglang's model interface.
 
@@ -78,10 +95,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 f"ATOM failed to create model for architecture {self.model_arch}"
             )
 
-        # Under SGLang dp-attention, ATOM runtime interprets non-MoE modules
-        # like lm_head with tp=1 semantics, so plugin logits must not perform
-        # an extra TP all-gather after local lm_head matmul.
-        plugin_skip_all_gather = bool(self.model.atom_config.enable_dp_attention)
+        # The adapter returned by _get_lm_head calls ATOM's ParallelLMHead.forward(),
+        # which already gathers TP logits. SGLang must not gather them again.
+        plugin_skip_all_gather = True
         self.logits_processor = LogitsProcessor(
             config, skip_all_gather=plugin_skip_all_gather
         )
@@ -102,6 +118,22 @@ class _AtomCausalLMBaseForSglang(nn.Module):
             else self.model
         )
         return embed_owner.embed_tokens.weight, self.model.lm_head.weight
+
+    def _get_lm_head(self):
+        if hasattr(self.model, "lm_head"):
+            lm_head = self.model.lm_head
+            if not isinstance(lm_head, _AtomLMHeadForSGLang):
+                return _AtomLMHeadForSGLang(lm_head)
+            return lm_head
+        language_model = getattr(self.model, "language_model", None)
+        if language_model is not None and hasattr(language_model, "lm_head"):
+            lm_head = language_model.lm_head
+            if not isinstance(lm_head, _AtomLMHeadForSGLang):
+                return _AtomLMHeadForSGLang(lm_head)
+            return lm_head
+        raise AttributeError(
+            f"{type(self.model).__name__} does not expose lm_head or language_model.lm_head"
+        )
 
     def set_embed_and_head(self, embed, head):
         if hasattr(self.model, "set_embed_and_head"):
@@ -191,10 +223,11 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 hidden_states = runtime.trim_output(hidden_states)
 
                 if self.pp_group.is_last_rank:
+                    lm_head = self._get_lm_head()
                     return self.logits_processor(
                         input_ids,
                         hidden_states,
-                        self.model.lm_head,
+                        lm_head,
                         forward_batch,
                     )
                 return hidden_states
