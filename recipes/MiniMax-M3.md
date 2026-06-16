@@ -28,6 +28,9 @@ model_path=/models/MiniMax-M3/
 
 ### BF16 on 8xMI355X GPUs (TP8)
 
+Native ATOM enables CUDAGraph by default. The command below lists the decode
+CUDAGraph capture sizes explicitly.
+
 ```bash
 model_path=/shared/data/amd_int/models/MiniMax-M3/
 export ATOM_USE_TRITON_MOE="${ATOM_USE_TRITON_MOE:-1}"
@@ -36,7 +39,8 @@ python -m atom.entrypoints.openai_server \
   --model "$model_path" \
   -tp 8 --server-port 8013 --trust-remote-code --gpu-memory-utilization 0.7 \
   --block-size 128 \
-  --no-enable_prefix_caching
+  --no-enable_prefix_caching \
+  --cudagraph-capture-sizes '[1,2,4,8,16,32,48,64,128,256,512]'
 ```
 
 Use the container path if the model directory is mounted at `/models`:
