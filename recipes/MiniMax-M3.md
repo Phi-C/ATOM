@@ -95,9 +95,9 @@ The following script can be used to benchmark online serving throughput and late
 
 ```bash
 model_path=/shared/data/amd_int/models/MiniMax-M3/
-ISL=1024
+ISL=8192
 OSL=1024
-CONC=128
+CONC=16
 
 python -m atom.benchmarks.benchmark_serving \
   --model="$model_path" \
