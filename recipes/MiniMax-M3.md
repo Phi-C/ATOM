@@ -102,6 +102,7 @@ The following command starts the MiniMax-M3-MXFP4 checkpoint:
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
+export ATOM_M3_SPARSE_USE_ASM_PA=1
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
@@ -121,6 +122,7 @@ Run GSM8K 5-shot with `lm_eval`:
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
+export ATOM_M3_SPARSE_USE_ASM_PA=1
 BS=65
 
 lm_eval \
@@ -141,4 +143,55 @@ local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://12
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9386|±  |0.0066|
 |     |       |strict-match    |     5|exact_match|↑  |0.9393|±  |0.0066|
+```
+
+### Serving Benchmark
+
+The following script can be used to benchmark online serving throughput and latency:
+
+```bash
+model_path=amd/MiniMax-M3-MXFP4
+export ATOM_M3_SPARSE_USE_ASM_PA=1
+ISL=8192
+OSL=1024
+CONC=16
+
+python -m atom.benchmarks.benchmark_serving \
+  --model="$model_path" \
+  --backend=vllm \
+  --base-url=http://localhost:8000 \
+  --dataset-name=random \
+  --random-input-len="${ISL}" \
+  --random-output-len="${OSL}" \
+  --random-range-ratio=0.8 \
+  --num-prompts=$(( CONC * 10 )) \
+  --max-concurrency="${CONC}" \
+  --request-rate=inf \
+  --ignore-eos \
+  --save-result \
+  --percentile-metrics="ttft,tpot,itl,e2el"
+```
+
+Reference result from the validated run on 4xMI355 GPUs:
+
+```text
+Successful requests:                     160
+Benchmark duration (s):                  240.38
+Total input tokens:                      1175032
+Total generated tokens:                  146426
+Request throughput (req/s):              0.67
+Output token throughput (tok/s):         609.14
+Total Token throughput (tok/s):          5497.34
+Mean TTFT (ms):                          565.86
+Median TTFT (ms):                        330.19
+P99 TTFT (ms):                           3415.41
+Mean TPOT (ms):                          24.73
+Median TPOT (ms):                        24.85
+P99 TPOT (ms):                           27.26
+Mean ITL (ms):                           24.72
+Median ITL (ms):                         21.01
+P99 ITL (ms):                            217.94
+Mean E2EL (ms):                          23191.59
+Median E2EL (ms):                        22982.91
+P99 E2EL (ms):                           27542.50
 ```
