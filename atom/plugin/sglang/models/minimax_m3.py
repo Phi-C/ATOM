@@ -148,3 +148,17 @@ class SGLangMiniMaxM3SparseAttention(nn.Module):
             self,
         )
         return self.o_proj(attn_output)
+
+
+def _patch_minimax_m3_attention_for_sglang(module) -> None:
+    # moduel.attn.attn: SGLang plugin RadixAttention
+    inner_attn = getattr(getattr(module, "attn", None), "attn", None)
+    if inner_attn is not None:
+        setattr(inner_attn, "_atom_minimax_m3_dense_mha", True)
+
+def setup_minimax_m3_for_sglang(model) -> None:
+    from atom.models.minimax_m3 import MiniMaxM3Attention
+
+    for module in model.modules():
+        if isinstance(module, MiniMaxM3Attention):
+            _patch_minimax_m3_attention_for_sglang(module)

@@ -262,8 +262,6 @@ class MiniMaxM3Attention(nn.Module):
             rotary_emb=None,
             prefix=f"{prefix}.attn",
         )
-        inner_attn = getattr(self.attn, "attn", self.attn)
-        setattr(inner_attn, "_atom_minimax_m3_dense_mha", True)
 
     def _qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor

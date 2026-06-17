@@ -67,6 +67,12 @@ def _install_deepseek_mla_adapters(model: Any) -> None:
     setup_deepseek_for_sglang(model)
 
 
+def _install_minimax_m3_adapters(model: Any) -> None:
+    from atom.plugin.sglang.models.minimax_m3 import setup_minimax_m3_for_sglang
+
+    setup_minimax_m3_for_sglang(model)
+
+
 MODEL_ADAPTER_SPECS = {
     "DeepseekV3ForCausalLM": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_mla_adapters,
@@ -97,10 +103,12 @@ MODEL_ADAPTER_SPECS = {
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_config=_prepare_minimax_m3_config,
+        install_adapters=_install_minimax_m3_adapters,
     ),
     "MiniMaxM3SparseForConditionalGeneration": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_config=_prepare_minimax_m3_config,
+        install_adapters=_install_minimax_m3_adapters,
     ),
 }
 
