@@ -16,6 +16,9 @@ selected blocks with a separate merge step, since one query token per request
 leaves the prefill kernels (which parallelize over the query dim) idle.
 """
 
+from dataclasses import dataclass
+
+import numpy as np
 import torch
 
 try:
@@ -28,61 +31,140 @@ except ModuleNotFoundError:
 SPARSE_BLOCK_SIZE = 128
 
 
-# ---------------------------------------------------------------------------
-# Fused qknorm + RoPE + KV insert (SHUFFLE main cache writer).
-#
-# Reference / fallback for ``aiter.fused_minimax_m3_qknorm_rope_kv_insert`` that
-# writes the MAIN K/V cache in page-16 SHUFFLE layout (via
-# ``aiter.reshape_and_cache(asm_layout=True)``) instead of the plain page-128
-# layout the aiter kernel writes. This lets AITER ASM paged-attention
-# (``pa_fwd_asm``) read the M3 main KV cache during decode.
-#
-# Math matches the aiter op test oracle exactly (gemma_rmsnorm + neox partial
-# RoPE in fp32, cast to the qkv dtype). Correctness is prioritized over speed:
-# this is a reference path, not the perf hot path.
-# ---------------------------------------------------------------------------
-def _gemma_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    xf = x.float()
-    variance = xf.pow(2).mean(dim=-1, keepdim=True)
-    return xf * torch.rsqrt(variance + eps) * (1.0 + weight.float())
+@dataclass
+class MiniMaxM3SparsePrefillMetadata:
+    cu_seqlens_q: torch.Tensor
+    seq_lens: torch.Tensor
+    context_lens: torch.Tensor
+    block_table: torch.Tensor
+    max_query_len: int
+    max_seq_len: int
+    # Per-query-token request id and absolute position, layer-INVARIANT (depend
+    # only on cu_seqlens_q + prefix_lens). Built ONCE in prepare_prefill and
+    # reused across all sparse layers by the ASM prefill block-table builder, so
+    # the per-layer build needs no host sync. None on the non-ASM path.
+    query_req_id: torch.Tensor | None = None  # [total_q] int32
+    query_abs_pos: torch.Tensor | None = None  # [total_q] int32
+    # Per-token CSR for pa_fwd_asm prefill (each token a length-1 segment):
+    # arange(total_q + 1). Layer-invariant, built once in prepare_prefill.
+    per_token_qo_indptr: torch.Tensor | None = None  # [total_q+1] int32
 
 
-def _apply_rope_neox_partial(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    rotary_dim: int,
-) -> torch.Tensor:
-    half = rotary_dim // 2
-    cos_sin = cos_sin_cache[positions].float()
-    cos = cos_sin[..., :half].unsqueeze(1)
-    sin = cos_sin[..., half:].unsqueeze(1)
-
-    rot = x[..., :rotary_dim]
-    x1 = rot[..., :half]
-    x2 = rot[..., half:]
-    out = x.clone()
-    out[..., :half] = x1 * cos - x2 * sin
-    out[..., half:rotary_dim] = x2 * cos + x1 * sin
-    return out
+@dataclass
+class MiniMaxM3SparseDecodeMetadata:
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
 
 
-def _norm_rope(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    eps: float,
-    rotary_dim: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """gemma_rmsnorm followed by partial neox RoPE, in fp32, cast to ``dtype``."""
-    normed = _gemma_rmsnorm(x.float(), weight, eps)
-    return _apply_rope_neox_partial(normed, positions, cos_sin_cache, rotary_dim).to(
-        dtype
+@dataclass
+class MiniMaxM3SparseMetadata:
+    seq_lens: torch.Tensor
+    max_seq_len: int
+    slot_mapping: torch.Tensor
+    num_prefills: int
+    prefill: MiniMaxM3SparsePrefillMetadata | None = None
+    decode: MiniMaxM3SparseDecodeMetadata | None = None
+
+
+def _build_prefill_query_metadata(
+    *,
+    cu_seqlens_q_cpu: np.ndarray,
+    seq_lens_cpu: np.ndarray,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build layer-invariant per-query metadata for the ASM prefill path."""
+    cu_np = np.asarray(cu_seqlens_q_cpu, dtype=np.int64)
+    seq_lens_np = np.asarray(seq_lens_cpu, dtype=np.int64)
+    batch = seq_lens_np.shape[0]
+    q_lens_np = cu_np[1 : batch + 1] - cu_np[:batch]
+    total_q = int(cu_np[batch])
+    prefix_np = (seq_lens_np - q_lens_np).astype(np.int64)
+    req_id_np = np.repeat(np.arange(batch, dtype=np.int32), q_lens_np)
+    abs_pos_np = (
+        prefix_np[req_id_np] + (np.arange(total_q, dtype=np.int64) - cu_np[req_id_np])
+    ).astype(np.int32)
+    return (
+        torch.from_numpy(req_id_np).to(device, non_blocking=True),
+        torch.from_numpy(abs_pos_np).to(device, non_blocking=True),
+        torch.arange(total_q + 1, dtype=torch.int32, device=device),
     )
 
 
+def make_minimax_m3_sparse_prefill_metadata(
+    *,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    max_query_len: int,
+    max_seq_len: int,
+    num_prefills: int,
+    seq_lens_cpu: np.ndarray | None = None,
+    cu_seqlens_q_cpu: np.ndarray | None = None,
+    include_query_metadata: bool = False,
+) -> MiniMaxM3SparseMetadata:
+    query_lens = cu_seqlens_q[1 : num_prefills + 1] - cu_seqlens_q[:num_prefills]
+    prefix_lens = seq_lens - query_lens
+    query_req_id = query_abs_pos = per_token_qo_indptr = None
+    if include_query_metadata:
+        if cu_seqlens_q_cpu is None or seq_lens_cpu is None:
+            raise ValueError(
+                "cu_seqlens_q_cpu and seq_lens_cpu are required when "
+                "include_query_metadata=True."
+            )
+        query_req_id, query_abs_pos, per_token_qo_indptr = (
+            _build_prefill_query_metadata(
+                cu_seqlens_q_cpu=cu_seqlens_q_cpu,
+                seq_lens_cpu=seq_lens_cpu,
+                device=block_table.device,
+            )
+        )
+    prefill = MiniMaxM3SparsePrefillMetadata(
+        cu_seqlens_q=cu_seqlens_q,
+        seq_lens=seq_lens,
+        context_lens=prefix_lens,
+        block_table=block_table,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
+        query_req_id=query_req_id,
+        query_abs_pos=query_abs_pos,
+        per_token_qo_indptr=per_token_qo_indptr,
+    )
+    return MiniMaxM3SparseMetadata(
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        slot_mapping=slot_mapping,
+        num_prefills=num_prefills,
+        prefill=prefill,
+        decode=None,
+    )
+
+
+def make_minimax_m3_sparse_decode_metadata(
+    *,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    max_seq_len: int,
+) -> MiniMaxM3SparseMetadata:
+    decode = MiniMaxM3SparseDecodeMetadata(seq_lens=seq_lens, block_table=block_table)
+    return MiniMaxM3SparseMetadata(
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        slot_mapping=slot_mapping,
+        num_prefills=0,
+        prefill=None,
+        decode=decode,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fused qknorm + RoPE + KV insert (SHUFFLE main cache writer).
+#
+# Fused Gemma-RMSNorm + partial-NeoX-RoPE + page-16 SHUFFLE KV insert.
+# This lets AITER ASM paged-attention (``pa_fwd_asm``) read the M3 main KV
+# cache during decode.
+# ---------------------------------------------------------------------------
 @triton.jit
 def _gemma_norm_rope_head(
     row_ptr,  # pointer to this head's input row (head_dim contiguous)
@@ -257,111 +339,6 @@ def _fused_qknorm_rope_kv_insert_shuffle_kernel(
 
 
 @torch.no_grad()
-def minimax_m3_fused_qknorm_rope_kv_insert_shuffle_ref(
-    qkv: torch.Tensor,  # [num_tokens, q_size + 2*kv_size + iq_size + ik_size]
-    q_norm_weight: torch.Tensor,  # [head_dim]
-    k_norm_weight: torch.Tensor,  # [head_dim]
-    cos_sin_cache: torch.Tensor,  # [max_pos, rotary_dim]
-    positions: torch.Tensor,  # [num_tokens] int
-    num_heads: int,
-    num_kv_heads: int,
-    rotary_dim: int,
-    eps: float,
-    index_q_norm_weight: torch.Tensor,  # [idx_head_dim]
-    index_k_norm_weight: torch.Tensor,  # [idx_head_dim]
-    num_index_heads: int,
-    slot_mapping: torch.Tensor,  # [num_tokens] int64 logical slots
-    kv_cache_k: torch.Tensor,  # SHUFFLE K cache [phys, num_kv_heads, head_dim//x, 16, x]
-    kv_cache_v: torch.Tensor,  # SHUFFLE V cache [phys, num_kv_heads, 16//x, head_dim, x]
-    index_cache: torch.Tensor,  # index K cache, viewable as [-1, idx_head_dim]
-    q_out: torch.Tensor,  # [num_tokens, q_size] normed+roped q
-    index_q_out: torch.Tensor,  # [num_tokens, iq_size] normed+roped index_q
-    idx_head_dim: int,
-) -> None:
-    """Reference for the fused M3 qknorm/rope/kv-insert, SHUFFLE main-cache variant.
-
-    Reproduces the exact semantics of ``aiter.fused_minimax_m3_qknorm_rope_kv_insert``
-    (gemma rmsnorm + partial neox RoPE on q/k/index_q/index_k, raw V), but writes
-    the main K/V into the page-16 SHUFFLE cache via
-    ``aiter.reshape_and_cache(asm_layout=True)`` (the proven SHUFFLE writer), and
-    scatters index_k into ``index_cache.view(-1, idx_head_dim)[slot_mapping]``.
-    """
-    import aiter
-
-    num_tokens = qkv.shape[0]
-    head_dim = q_norm_weight.shape[-1]
-    dtype = qkv.dtype
-
-    q_size = num_heads * head_dim
-    kv_size = num_kv_heads * head_dim
-    iq_size = num_index_heads * head_dim
-    ik_size = idx_head_dim
-
-    q_in, k_in, v_in, iq_in, ik_in = qkv.split(
-        [q_size, kv_size, kv_size, iq_size, ik_size], dim=-1
-    )
-
-    # q / index_q -> normed + roped outputs.
-    q_ref = _norm_rope(
-        q_in.view(num_tokens, num_heads, head_dim),
-        q_norm_weight,
-        positions,
-        cos_sin_cache,
-        eps,
-        rotary_dim,
-        dtype,
-    ).view(num_tokens, q_size)
-    q_out.copy_(q_ref)
-
-    iq_ref = _norm_rope(
-        iq_in.view(num_tokens, num_index_heads, head_dim),
-        index_q_norm_weight,
-        positions,
-        cos_sin_cache,
-        eps,
-        rotary_dim,
-        dtype,
-    ).view(num_tokens, iq_size)
-    index_q_out.copy_(iq_ref)
-
-    # k -> normed + roped; v -> raw. Both written to the SHUFFLE main cache.
-    k_ref = _norm_rope(
-        k_in.view(num_tokens, num_kv_heads, head_dim),
-        k_norm_weight,
-        positions,
-        cos_sin_cache,
-        eps,
-        rotary_dim,
-        dtype,
-    ).view(num_tokens, num_kv_heads, head_dim)
-    v_raw = v_in.view(num_tokens, num_kv_heads, head_dim).contiguous()
-
-    aiter.reshape_and_cache(
-        k_ref,
-        v_raw,
-        kv_cache_k,
-        kv_cache_v,
-        slot_mapping,
-        kv_cache_dtype="auto",
-        k_scale=None,
-        v_scale=None,
-        asm_layout=True,
-    )
-
-    # index_k -> single head, normed + roped; plain scatter into index_cache.
-    ik_ref = _norm_rope(
-        ik_in.view(num_tokens, 1, idx_head_dim),
-        index_k_norm_weight,
-        positions,
-        cos_sin_cache,
-        eps,
-        rotary_dim,
-        dtype,
-    ).view(num_tokens, idx_head_dim)
-    index_cache.view(-1, idx_head_dim)[slot_mapping] = ik_ref.to(index_cache.dtype)
-
-
-@torch.no_grad()
 def minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
     qkv: torch.Tensor,  # [num_tokens, q_size + 2*kv_size + iq_size + ik_size]
     q_norm_weight: torch.Tensor,  # [head_dim]
@@ -387,8 +364,8 @@ def minimax_m3_fused_qknorm_rope_kv_insert_shuffle(
 
     One fused kernel doing q/index_q norm+rope (-> q_out/index_q_out), k norm+rope
     + raw v -> SHUFFLE K/V cache, and index_k norm+rope -> page-128 index cache.
-    Drop-in for the pure-PyTorch ``..._ref`` (kept for tests). Math matches the
-    AITER fused op oracle; K/V writes match ``reshape_and_cache(asm_layout=True)``.
+    Math matches the AITER fused op oracle; K/V writes match
+    ``reshape_and_cache(asm_layout=True)``.
     """
     num_tokens = qkv.shape[0]
     head_dim = q_norm_weight.shape[-1]
@@ -932,266 +909,6 @@ def minimax_m3_sparse_attn_decode(
         output.stride(1),
         output.stride(2),
         NUM_TOPK_CHUNKS=num_topk_chunks,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Page-16 SHUFFLE prefill kernel. Identical math to _gqa_sparse_fwd_kernel;
-# only the K/V load addressing differs: the plain page-128 cache is replaced by
-# a page-16 SHUFFLE cache split into separate K and V tensors.
-#
-#   K SHUFFLE: [num_phys_blocks, num_kv_heads, head_dim//x, 16, x]
-#   V SHUFFLE: [num_phys_blocks, num_kv_heads, 16//x, head_dim, x]   (x = 16//itemsize)
-#
-# A selected logical 128-block ``blk`` maps to 8 physical 16-pages:
-#   phys_page(j) = block_table[blk]*PAGES_PER_SPARSE_BLOCK + j,  j in 0..7
-# Within a sparse-block-local position p in [0,128): j = p//16, intra = p%16.
-# For (head h, intra s in [0,16), dim d in [0,128)):
-#   K element: k_cache[phys, h, d//x, s, d%x]
-#   V element: v_cache[phys, h, s//x, d, s%x]
-# ---------------------------------------------------------------------------
-@triton.heuristics(
-    {
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
-        "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
-        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
-        * triton.next_power_of_2(args["gqa_group_size"]),
-    }
-)
-@triton.jit
-def _gqa_sparse_fwd_kernel_shuffle(
-    q_ptr,  # [total_q, num_heads, head_dim]
-    k_cache_ptr,  # SHUFFLE K [num_phys_blocks, num_kv_heads, head_dim//x, 16, x]
-    v_cache_ptr,  # SHUFFLE V [num_phys_blocks, num_kv_heads, 16//x, head_dim, x]
-    t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
-    o_ptr,  # [total_q, num_heads, head_dim]
-    block_table_ptr,  # [num_reqs, max_blocks]
-    cu_seqlens_q,
-    cu_seqblocks_q,
-    seq_lens,
-    prefix_lens,
-    num_kv_heads,
-    gqa_group_size,
-    head_dim,
-    max_topk,
-    num_q_loop,
-    sm_scale,
-    stride_qn,
-    stride_qh,
-    stride_qd,
-    # K SHUFFLE strides: [blk, h, d//x, s(16), x]
-    stride_k_blk,
-    stride_k_h,
-    stride_k_dx,
-    stride_k_s,
-    stride_k_x,
-    # V SHUFFLE strides: [blk, h, s//x, d, x]
-    stride_v_blk,
-    stride_v_h,
-    stride_v_sx,
-    stride_v_d,
-    stride_v_x,
-    stride_th,
-    stride_tn,
-    stride_tk,
-    stride_on,
-    stride_oh,
-    stride_od,
-    stride_bt_b,
-    X: tl.constexpr,  # 16 // dtype.itemsize (bf16 -> 8)
-    PAGES_PER_BLOCK: tl.constexpr,  # PAGES_PER_SPARSE_BLOCK (8)
-    ASM_PAGE: tl.constexpr,  # ASM_PAGE_SIZE (16)
-    BLOCK_SIZE_Q: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
-    BLOCK_SIZE_D: tl.constexpr,
-    BLOCK_SIZE_H: tl.constexpr,
-    BLOCK_SIZE_T: tl.constexpr,
-    BLOCK_SIZE_QH: tl.constexpr,
-):
-    sm_scale_log2e = sm_scale * 1.4426950409
-    pid_q = tl.program_id(0)
-    pid_kh = tl.program_id(1)
-    pid_b = tl.program_id(2)
-    pid_h = pid_kh * gqa_group_size
-    q_start = tl.load(cu_seqlens_q + pid_b)
-    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
-    q_block_start = tl.load(cu_seqblocks_q + pid_b)
-    q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
-    seq_len = tl.load(seq_lens + pid_b)
-    prefix_len = tl.load(prefix_lens + pid_b)
-    if pid_q * num_q_loop >= q_block_len:
-        return
-    real_q_loop = min(num_q_loop, q_block_len - pid_q * num_q_loop)
-    bt_row = block_table_ptr + pid_b * stride_bt_b
-    off_n = tl.arange(0, BLOCK_SIZE_K)
-    off_d = tl.arange(0, BLOCK_SIZE_D)
-    d_mask = off_d < head_dim
-    # SHUFFLE decomposition of the 128 sparse-block-local positions:
-    #   j = p // 16 (which physical 16-page), s = p % 16 (intra-page position).
-    j_of_n = off_n // ASM_PAGE
-    s_of_n = off_n % ASM_PAGE
-    # SHUFFLE decomposition of the head_dim: dx = d // x, dr = d % x.
-    dx_of_d = off_d // X
-    dr_of_d = off_d % X
-    for j in range(real_q_loop):
-        pid_q_j = pid_q * num_q_loop + j
-        t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
-        off_t = tl.arange(0, BLOCK_SIZE_T)
-        topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
-        real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_qn, stride_qh, stride_qd),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
-        )
-        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
-        off_q = (
-            tl.arange(0, BLOCK_SIZE_Q)[:, None]
-            + pid_q_j * BLOCK_SIZE_Q
-            + prefix_len
-            - tl.arange(0, BLOCK_SIZE_K)[None, :]
-        )
-        m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
-        lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
-        acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
-        q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
-        for _ in range(real_topk):
-            blk = tl.load(t_ptr_j).to(tl.int32)
-            t_ptr_j = t_ptr_j + stride_tk
-            c = blk * BLOCK_SIZE_K
-            # logical 128-page id -> base physical 16-page (logical*8 + j).
-            base_phys = tl.load(bt_row + blk).to(tl.int64) * PAGES_PER_BLOCK
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            # physical page + intra-page position for each of the 128 positions.
-            phys_n = base_phys + j_of_n  # [BLOCK_SIZE_K]
-            # K SHUFFLE address for [d (rows), p (cols)]:
-            #   k_cache[phys, h, d//x, s, d%x]
-            k = tl.load(
-                k_cache_ptr
-                + phys_n[None, :] * stride_k_blk
-                + pid_kh * stride_k_h
-                + dx_of_d[:, None] * stride_k_dx
-                + s_of_n[None, :] * stride_k_s
-                + dr_of_d[:, None] * stride_k_x,
-                mask=d_mask[:, None] & pos_mask[None, :],
-                other=0.0,
-            )
-            qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-            # causal: q_abs_pos - k_off >= block_start (c)
-            qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
-            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
-            qk += tl.dot(q, k) * sm_scale_log2e
-            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
-            l_ij = tl.sum(p, axis=1)
-            acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-            # V SHUFFLE address for [p (rows), d (cols)]:
-            #   v_cache[phys, h, s//x, d, s%x]
-            v = tl.load(
-                v_cache_ptr
-                + phys_n[:, None] * stride_v_blk
-                + pid_kh * stride_v_h
-                + (s_of_n[:, None] // X) * stride_v_sx
-                + off_d[None, :] * stride_v_d
-                + (s_of_n[:, None] % X) * stride_v_x,
-                mask=pos_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
-            acc_o += tl.dot(p.to(v.dtype), v)
-            m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-        acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
-        acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
-        o_ptrs = tl.make_block_ptr(
-            base=o_ptr + q_start * stride_on + pid_h * stride_oh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_on, stride_oh, stride_od),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
-        )
-        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
-
-
-@torch.no_grad()
-def minimax_m3_sparse_attn_shuffle(
-    q: torch.Tensor,  # [total_q, num_heads, head_dim]
-    k_cache: torch.Tensor,  # SHUFFLE K [num_phys_blocks, num_kv_heads, head_dim//x, 16, x]
-    v_cache: torch.Tensor,  # SHUFFLE V [num_phys_blocks, num_kv_heads, 16//x, head_dim, x]
-    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk]
-    block_table: torch.Tensor,  # [batch, max_blocks] logical 128-granularity
-    cu_seqlens_q: torch.Tensor,  # [batch+1] int32
-    seq_lens: torch.Tensor,  # [batch] int32
-    prefix_lens: torch.Tensor,  # [batch] int32
-    max_query_len: int,
-    num_kv_heads: int,
-    sm_scale: float,
-    output: torch.Tensor,  # [total_q, num_heads, head_dim]
-) -> None:
-    """GQA block-sparse prefill attention over a page-16 SHUFFLE KV cache.
-
-    Math-identical to ``minimax_m3_sparse_attn`` (online base-2 softmax, causal
-    diagonal, GQA group reshaping); only the K/V load addressing differs. Each
-    selected logical 128-block expands to ``PAGES_PER_SPARSE_BLOCK`` physical
-    16-pages (physical = logical*8 + j). bf16 only.
-    """
-    assert q.dtype == torch.bfloat16, "shuffle prefill kernel is bf16-only"
-    assert not _is_fp8_kv_cache_tensor(k_cache), "shuffle prefill kernel is bf16-only"
-    total_q, num_heads, head_dim = q.shape
-    batch = cu_seqlens_q.shape[0] - 1
-    topk = topk_idx.shape[-1]
-    gqa_group_size = num_heads // num_kv_heads
-    x = 16 // k_cache.element_size()  # bf16 -> 8
-    grid = (max_query_len, num_kv_heads, batch)
-    _gqa_sparse_fwd_kernel_shuffle[grid](
-        q,
-        k_cache,
-        v_cache,
-        topk_idx,
-        output,
-        block_table,
-        cu_seqlens_q,
-        cu_seqlens_q,  # cu_seqblocks_q == cu_seqlens_q when block_size_q == 1
-        seq_lens,
-        prefix_lens,
-        num_kv_heads,
-        gqa_group_size,
-        head_dim,
-        topk,
-        1,  # num_q_loop
-        sm_scale,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        k_cache.stride(3),
-        k_cache.stride(4),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
-        v_cache.stride(3),
-        v_cache.stride(4),
-        topk_idx.stride(0),
-        topk_idx.stride(1),
-        topk_idx.stride(2),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        block_table.stride(0),
-        X=x,
-        PAGES_PER_BLOCK=PAGES_PER_SPARSE_BLOCK,
-        ASM_PAGE=ASM_PAGE_SIZE,
-        BLOCK_SIZE_Q=1,
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        num_stages=1,
     )
 
 

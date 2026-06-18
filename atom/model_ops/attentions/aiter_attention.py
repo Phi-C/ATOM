@@ -647,21 +647,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "block_tables"
             ].copy_to_gpu(bs)
         if self._is_minimax_m3_sparse:
-            from atom.model_ops.minimax_m3.metadata import (
-                MiniMaxM3SparseMetadata,
-                MiniMaxM3SparsePrefillMetadata,
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_minimax_m3_sparse_prefill_metadata,
             )
-            from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
             bs = batch.total_seqs_num_prefill
-            cu_q = attn_metadata.cu_seqlens_q
-            seq_lens = attn_metadata.context_lens
-            query_lens = cu_q[1 : bs + 1] - cu_q[:bs]
-            prefix_lens = seq_lens - query_lens
             seq_lens_cpu = np.asarray(batch.context_lens[:bs], dtype=np.int64)
-            total_kv_blocks = int(
-                ((seq_lens_cpu + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE).sum()
-            )
             # Per-query-token request id + absolute position, built ONCE here on
             # the CPU (numpy, no device sync) and reused by every sparse layer's
             # ASM prefill block-table builder. Layer-invariant: depends only on
@@ -671,44 +662,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
                 dtype=np.int64,
             )
-            q_lens_np = cu_np[1:] - cu_np[:bs]
-            total_q = int(cu_np[bs])
-            prefix_np = (seq_lens_cpu - q_lens_np).astype(np.int64)
-            req_id_np = np.repeat(np.arange(bs, dtype=np.int32), q_lens_np)
-            abs_pos_np = (
-                prefix_np[req_id_np]
-                + (np.arange(total_q, dtype=np.int64) - cu_np[req_id_np])
-            ).astype(np.int32)
-            dev = attn_metadata.block_tables.device
-            query_req_id = torch.from_numpy(req_id_np).to(dev, non_blocking=True)
-            query_abs_pos = torch.from_numpy(abs_pos_np).to(dev, non_blocking=True)
-            per_token_qo_indptr = torch.arange(
-                total_q + 1, dtype=torch.int32, device=dev
-            )
-            prefill = MiniMaxM3SparsePrefillMetadata(
-                cu_seqlens_q=cu_q,
-                cu_seqlens_k=attn_metadata.cu_seqlens_k,
-                seq_lens=seq_lens,
-                context_lens=prefix_lens,
-                block_table=attn_metadata.block_tables,
-                max_query_len=attn_metadata.max_seqlen_q,
-                max_seq_len=attn_metadata.max_seqlen_k,
-                total_kv_blocks=total_kv_blocks,
-                query_req_id=query_req_id,
-                query_abs_pos=query_abs_pos,
-                per_token_qo_indptr=per_token_qo_indptr,
-            )
-            attn_metadata.minimax_m3_sparse_metadata = MiniMaxM3SparseMetadata(
-                seq_lens=seq_lens,
-                max_seq_len=attn_metadata.max_seqlen_k,
-                slot_mapping=attn_metadata.slot_mapping,
-                num_actual_tokens=batch.total_tokens_num_prefill,
-                num_decodes=0,
-                num_decode_tokens=0,
-                num_prefills=bs,
-                num_prefill_tokens=batch.total_tokens_num_prefill,
-                prefill=prefill,
-                decode=None,
+            attn_metadata.minimax_m3_sparse_metadata = (
+                make_minimax_m3_sparse_prefill_metadata(
+                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                    seq_lens=attn_metadata.context_lens,
+                    block_table=attn_metadata.block_tables,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    max_query_len=attn_metadata.max_seqlen_q,
+                    max_seq_len=attn_metadata.max_seqlen_k,
+                    num_prefills=bs,
+                    seq_lens_cpu=seq_lens_cpu,
+                    cu_seqlens_q_cpu=cu_np,
+                    include_query_metadata=True,
+                )
             )
         if self._tbo_token_split:
             self._stash_tbo_token_split_prefill_state(batch)
@@ -905,60 +871,33 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         if self._is_minimax_m3_sparse:
-            from atom.model_ops.minimax_m3.metadata import (
-                MiniMaxM3SparseDecodeMetadata,
-                MiniMaxM3SparseMetadata,
-                MiniMaxM3SparsePrefillMetadata,
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_minimax_m3_sparse_decode_metadata,
+                make_minimax_m3_sparse_prefill_metadata,
             )
-            from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
             if max_seqlen_q <= 1:
-                decode = MiniMaxM3SparseDecodeMetadata(
-                    seq_lens=attn_metadata.context_lens[:scheduled_bs],
-                    block_table=attn_metadata.block_tables[:scheduled_bs],
-                )
-                attn_metadata.minimax_m3_sparse_metadata = MiniMaxM3SparseMetadata(
-                    seq_lens=attn_metadata.context_lens[:scheduled_bs],
-                    max_seq_len=int(max_seqlen_k),
-                    slot_mapping=attn_metadata.slot_mapping,
-                    num_actual_tokens=sum_scheduled_tokens,
-                    num_decodes=scheduled_bs,
-                    num_decode_tokens=sum_scheduled_tokens,
-                    num_prefills=0,
-                    num_prefill_tokens=0,
-                    prefill=None,
-                    decode=decode,
+                attn_metadata.minimax_m3_sparse_metadata = (
+                    make_minimax_m3_sparse_decode_metadata(
+                        seq_lens=attn_metadata.context_lens[:scheduled_bs],
+                        block_table=attn_metadata.block_tables[:scheduled_bs],
+                        slot_mapping=attn_metadata.slot_mapping,
+                        max_seq_len=int(max_seqlen_k),
+                    )
                 )
             else:
                 cu_q = attn_metadata.cu_seqlens_q
                 seq_lens = attn_metadata.context_lens[:scheduled_bs]
-                query_lens = cu_q[1 : scheduled_bs + 1] - cu_q[:scheduled_bs]
-                prefix_lens = seq_lens - query_lens
-                seq_lens_cpu = np.asarray(context_lens[:scheduled_bs], dtype=np.int64)
-                total_kv_blocks = int(
-                    ((seq_lens_cpu + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE).sum()
-                )
-                prefill = MiniMaxM3SparsePrefillMetadata(
-                    cu_seqlens_q=cu_q[: scheduled_bs + 1],
-                    cu_seqlens_k=cu_q[: scheduled_bs + 1],
-                    seq_lens=seq_lens,
-                    context_lens=prefix_lens,
-                    block_table=attn_metadata.block_tables[:scheduled_bs],
-                    max_query_len=max_seqlen_q,
-                    max_seq_len=int(max_seqlen_k),
-                    total_kv_blocks=total_kv_blocks,
-                )
-                attn_metadata.minimax_m3_sparse_metadata = MiniMaxM3SparseMetadata(
-                    seq_lens=seq_lens,
-                    max_seq_len=int(max_seqlen_k),
-                    slot_mapping=attn_metadata.slot_mapping,
-                    num_actual_tokens=sum_scheduled_tokens,
-                    num_decodes=0,
-                    num_decode_tokens=0,
-                    num_prefills=scheduled_bs,
-                    num_prefill_tokens=sum_scheduled_tokens,
-                    prefill=prefill,
-                    decode=None,
+                attn_metadata.minimax_m3_sparse_metadata = (
+                    make_minimax_m3_sparse_prefill_metadata(
+                        cu_seqlens_q=cu_q[: scheduled_bs + 1],
+                        seq_lens=seq_lens,
+                        block_table=attn_metadata.block_tables[:scheduled_bs],
+                        slot_mapping=attn_metadata.slot_mapping,
+                        max_query_len=max_seqlen_q,
+                        max_seq_len=int(max_seqlen_k),
+                        num_prefills=scheduled_bs,
+                    )
                 )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q
@@ -1149,67 +1088,32 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             **ctx_pa_ps,
         )
         if self._is_minimax_m3_sparse:
-            from atom.model_ops.minimax_m3.metadata import (
-                MiniMaxM3SparseDecodeMetadata,
-                MiniMaxM3SparseMetadata,
-                MiniMaxM3SparsePrefillMetadata,
+            from atom.model_ops.minimax_m3.sparse_attn import (
+                make_minimax_m3_sparse_decode_metadata,
+                make_minimax_m3_sparse_prefill_metadata,
             )
-            from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
             seq_lens = attn_metadata.context_lens
             if max_q_len <= 1:
-                decode = MiniMaxM3SparseDecodeMetadata(
-                    seq_lens=seq_lens,
-                    block_table=attn_metadata.block_tables,
-                )
-                attn_metadata.minimax_m3_sparse_metadata = MiniMaxM3SparseMetadata(
-                    seq_lens=seq_lens,
-                    max_seq_len=attn_metadata.max_seqlen_k,
-                    slot_mapping=attn_metadata.slot_mapping,
-                    num_actual_tokens=total_tokens,
-                    num_decodes=bs,
-                    num_decode_tokens=total_tokens,
-                    num_prefills=0,
-                    num_prefill_tokens=0,
-                    prefill=None,
-                    decode=decode,
+                attn_metadata.minimax_m3_sparse_metadata = (
+                    make_minimax_m3_sparse_decode_metadata(
+                        seq_lens=seq_lens,
+                        block_table=attn_metadata.block_tables,
+                        slot_mapping=attn_metadata.slot_mapping,
+                        max_seq_len=attn_metadata.max_seqlen_k,
+                    )
                 )
             else:
-                query_lens = (
-                    attn_metadata.cu_seqlens_q[1 : bs + 1]
-                    - attn_metadata.cu_seqlens_q[:bs]
-                )
-                prefix_lens = seq_lens - query_lens
-                total_kv_blocks = (
-                    torch.div(
-                        seq_lens + SPARSE_BLOCK_SIZE - 1,
-                        SPARSE_BLOCK_SIZE,
-                        rounding_mode="floor",
+                attn_metadata.minimax_m3_sparse_metadata = (
+                    make_minimax_m3_sparse_prefill_metadata(
+                        cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                        seq_lens=seq_lens,
+                        block_table=attn_metadata.block_tables,
+                        slot_mapping=attn_metadata.slot_mapping,
+                        max_query_len=max_q_len,
+                        max_seq_len=attn_metadata.max_seqlen_k,
+                        num_prefills=bs,
                     )
-                    .sum()
-                    .item()
-                )
-                prefill = MiniMaxM3SparsePrefillMetadata(
-                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
-                    cu_seqlens_k=attn_metadata.cu_seqlens_q,
-                    seq_lens=seq_lens,
-                    context_lens=prefix_lens,
-                    block_table=attn_metadata.block_tables,
-                    max_query_len=max_q_len,
-                    max_seq_len=attn_metadata.max_seqlen_k,
-                    total_kv_blocks=int(total_kv_blocks),
-                )
-                attn_metadata.minimax_m3_sparse_metadata = MiniMaxM3SparseMetadata(
-                    seq_lens=seq_lens,
-                    max_seq_len=attn_metadata.max_seqlen_k,
-                    slot_mapping=attn_metadata.slot_mapping,
-                    num_actual_tokens=total_tokens,
-                    num_decodes=0,
-                    num_decode_tokens=0,
-                    num_prefills=bs,
-                    num_prefill_tokens=total_tokens,
-                    prefill=prefill,
-                    decode=None,
                 )
 
         positions = var["positions"].copy_to_gpu(total_tokens)
