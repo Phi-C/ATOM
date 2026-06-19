@@ -1,6 +1,6 @@
 # MiniMax-M3 Usage Guide
 
-[MiniMax-M3](https://huggingface.co/amd/MiniMax-M3), [MiniMax-M3-MXFP4](https://huggingface.co/amd/MiniMax-M3-MXFP4), and [MiniMax-M3-MXFP8](https://huggingface.co/amd/MiniMax-M3-MXFP8) are supported by the native ATOM OpenAI-compatible server path.
+[MiniMax-M3](https://huggingface.co/MiniMaxAI/MiniMax-M3), [MiniMax-M3-MXFP4](https://huggingface.co/amd/MiniMax-M3-MXFP4), and [MiniMax-M3-MXFP8](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) are supported by the native ATOM OpenAI-compatible server path.
 
 ## Preparing Environment
 
@@ -18,7 +18,7 @@ Native ATOM enables CUDAGraph by default. The command below lists the decode
 CUDAGraph capture sizes explicitly.
 
 ```bash
-model_path=amd/MiniMax-M3
+model_path=MiniMaxAI/MiniMax-M3
 export ATOM_USE_TRITON_MOE="${ATOM_USE_TRITON_MOE:-1}"
 
 python -m atom.entrypoints.openai_server \
@@ -54,7 +54,7 @@ Reference response from the validated run:
 
 ```json
 {
-  "model": "amd/MiniMax-M3",
+  "model": "MiniMaxAI/MiniMax-M3",
   "choices": [
     {
       "text": " Beijing. The the capital of China is Beijing.",
@@ -74,7 +74,7 @@ Reference response from the validated run:
 Run GSM8K 5-shot with `lm_eval`:
 
 ```bash
-model_path=amd/MiniMax-M3
+model_path=MiniMaxAI/MiniMax-M3
 
 lm_eval --model local-completions \
         --model_args model=$model_path,base_url=http://localhost:8013/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
@@ -85,7 +85,7 @@ lm_eval --model local-completions \
 Validated GSM8K result:
 
 ```text
-local-completions ({'model': 'amd/MiniMax-M3', 'base_url': 'http://localhost:8013/v1/completions', 'num_concurrent': 65, 'max_retries': 1, 'tokenized_requests': False}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 1
+local-completions ({'model': 'MiniMaxAI/MiniMax-M3', 'base_url': 'http://localhost:8013/v1/completions', 'num_concurrent': 65, 'max_retries': 1, 'tokenized_requests': False}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 1
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9181|±  |0.0076|
@@ -99,7 +99,7 @@ local-completions ({'model': 'amd/MiniMax-M3', 'base_url': 'http://localhost:801
 ### Launching Server
 
 MXFP4 and MXFP8 use the same launch path.  Set
-`model_path=amd/MiniMax-M3-MXFP8 run_name=m3-mxfp8` to run the MXFP8
+`model_path=MiniMaxAI/MiniMax-M3-MXFP8 run_name=m3-mxfp8` to run the MXFP8
 checkpoint.
 
 ```bash
@@ -151,7 +151,7 @@ local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://12
 Validated MXFP8 GSM8K result:
 
 ```text
-local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP8', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
+local-chat-completions ({'model': 'MiniMaxAI/MiniMax-M3-MXFP8', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9469|±  |0.0062|
@@ -223,7 +223,7 @@ server command above plus the three speculative-decoding flags):
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
-model_path=amd/MiniMax-M3-MXFP8
+model_path=MiniMaxAI/MiniMax-M3-MXFP8
 draft_path=Inferact/MiniMax-M3-EAGLE3
 
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
@@ -249,7 +249,7 @@ Run GSM8K 5-shot with `lm_eval` (identical to the non-speculative test):
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
-model_path=amd/MiniMax-M3-MXFP8
+model_path=MiniMaxAI/MiniMax-M3-MXFP8
 BS=65
 
 lm_eval \
@@ -275,7 +275,7 @@ local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://12
 Validated MXFP8+EAGLE GSM8K result:
 
 ```text
-local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP8', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
+local-chat-completions ({'model': 'MiniMaxAI/MiniMax-M3-MXFP8', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9500|±  |0.0061|
