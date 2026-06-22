@@ -7,6 +7,8 @@ from typing import Type
 import aiter
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import CpuGpuBuffer, envs
@@ -22,6 +24,36 @@ logger = logging.getLogger("atom")
 
 def cdiv(a, b):
     return (a + b - 1) // b
+
+
+@triton.jit
+def _mtp_decode_slot_mapping_kernel(
+    context_lens_ptr,
+    block_tables_ptr,
+    slot_mapping_ptr,
+    bs,
+    skip_update: tl.constexpr,
+    block_size: tl.constexpr,
+    block_table_stride: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    if not skip_update:
+        seq = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = seq < bs
+
+        ctx = tl.load(context_lens_ptr + seq, mask=mask, other=1).to(tl.int64)
+        last_pos = tl.maximum(ctx - 1, 0)
+        block_col = last_pos // block_size
+        within_block = last_pos - block_col * block_size
+
+        phys_block = tl.load(
+            block_tables_ptr + seq * block_table_stride + block_col,
+            mask=mask,
+            other=0,
+        ).to(tl.int64)
+        tl.store(
+            slot_mapping_ptr + seq, phys_block * block_size + within_block, mask=mask
+        )
 
 
 class AiterBackend(AttentionBackend):
@@ -161,6 +193,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # per-forward in-place update in prepare_decode is visible at every
             # replay; filled once per forward and shared by all sparse layers.
             "sparse_prefix_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            "sparse_decode_seq_lens": CpuGpuBuffer(
+                self.max_bs * max_qlen, **i32_kwargs
+            ),
+            "sparse_decode_block_tables": CpuGpuBuffer(
+                self.max_bs * max_qlen,
+                self.max_num_blocks_per_seq // self.block_ratio,
+                **i32_kwargs,
+            ),
         }
         self.model_runner.forward_vars.update(pa_persistent_metadata)
         # Per-ubatch buffers for CUDAGraph TBO
@@ -351,23 +391,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         """
         var = self.model_runner.forward_vars
         slot_mapping = var["slot_mapping"].gpu[:bs]
-        # Warmup/dummy runs before KV allocation: the draft attention is skipped
-        # (PagedAttentionImpl's is_dummy_run guard), so slot_mapping is unused.
-        # The dummy batch's context_lens is the full prefill length, which eagle
-        # bumps by +1 to max_model_len+1 — its derived block column overruns the
-        # block_tables width and would OOB the gather below. No-op during dummy
-        # runs, matching deepseek_v4_attn.prepare_mtp_decode.
-        if get_forward_context().context.is_dummy_run:
-            return {"slot_mapping": slot_mapping}
-        block_size = self.model_runner.block_size
-        ctx = var["context_lens"].gpu[:bs]  # int32, already +1 for this step
-        block_tables = var["block_tables"].gpu[:bs]  # [bs, max_blocks] int32
-        last_pos = (ctx - 1).clamp_min(0).long()
-        block_col = last_pos // block_size
-        within = last_pos - block_col * block_size
-        phys_block = torch.gather(block_tables, 1, block_col.unsqueeze(1)).squeeze(1)
-        slot = phys_block.long() * block_size + within
-        slot_mapping.copy_(slot.to(slot_mapping.dtype))
+        block_tables = var["block_tables"].gpu
+        context_lens = var["context_lens"].gpu
+        # Dummy runs skip the draft attention, so keep this launch as a no-op:
+        # their synthetic context_lens can point past block_tables.
+        _mtp_decode_slot_mapping_kernel[(max(1, triton.cdiv(bs, 128)),)](
+            context_lens,
+            block_tables,
+            slot_mapping,
+            bs,
+            bs == 0 or get_forward_context().context.is_dummy_run,
+            self.model_runner.block_size,
+            block_tables.stride(0),
+            BLOCK=128,
+        )
         return {"slot_mapping": slot_mapping}
 
     def compute_block_bytes(self) -> int:
@@ -943,7 +980,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if self._is_minimax_m3_sparse:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_minimax_m3_sparse_decode_metadata,
-                make_minimax_m3_sparse_prefill_metadata,
+                make_minimax_m3_sparse_small_q_decode_metadata,
             )
 
             if max_seqlen_q <= 1:
@@ -957,7 +994,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             else:
                 cu_q = attn_metadata.cu_seqlens_q
-                seq_lens = attn_metadata.context_lens[:scheduled_bs]
+                seq_lens = attn_metadata.context_lens[:bs]
                 # Spec-verify (decode with q>1, EAGLE) is CUDAGraph-captured, so
                 # prefix_lens must come from a PERSISTENT buffer: a fresh
                 # seq_lens-query_lens tensor would freeze at capture time and feed
@@ -966,20 +1003,51 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 # and bind it as the metadata's context_lens.
                 query_lens = cu_q[1 : scheduled_bs + 1] - cu_q[:scheduled_bs]
                 pf = self.model_runner.forward_vars["sparse_prefix_lens"]
-                prefix_lens = pf.gpu[:scheduled_bs]
-                torch.sub(seq_lens, query_lens, out=prefix_lens)
+                prefix_lens = pf.gpu[:bs]
+                torch.sub(
+                    seq_lens[:scheduled_bs],
+                    query_lens,
+                    out=prefix_lens[:scheduled_bs],
+                )
                 if bs > scheduled_bs:
-                    pf.gpu[scheduled_bs:bs].zero_()
-                sparse_md = make_minimax_m3_sparse_prefill_metadata(
-                    cu_seqlens_q=cu_q[: scheduled_bs + 1],
+                    prefix_lens[scheduled_bs:bs].zero_()
+                total_q_capacity = bs * max_seqlen_q
+                query_seq_lens_buf = self.model_runner.forward_vars[
+                    "sparse_decode_seq_lens"
+                ]
+                query_block_tables_buf = self.model_runner.forward_vars[
+                    "sparse_decode_block_tables"
+                ]
+                query_seq_lens_buf.np[:total_q_capacity] = 0
+                query_block_tables_buf.np[:total_q_capacity] = 0
+                cu_q_cpu = self.model_runner.forward_vars["cu_seqlens_q"].np
+                block_tables_np = self.model_runner.forward_vars["block_tables"].np
+                for req_id in range(scheduled_bs):
+                    q_start = int(cu_q_cpu[req_id])
+                    q_end = int(cu_q_cpu[req_id + 1])
+                    q_len = q_end - q_start
+                    prefix_len = int(context_lens[req_id]) - q_len
+                    for qid in range(q_start, q_end):
+                        q_offset = qid - q_start
+                        query_seq_lens_buf.np[qid] = min(
+                            int(context_lens[req_id]), prefix_len + q_offset + 1
+                        )
+                        query_block_tables_buf.np[qid] = block_tables_np[req_id]
+                query_seq_lens = query_seq_lens_buf.copy_to_gpu(total_q_capacity)
+                query_block_table = query_block_tables_buf.copy_to_gpu(
+                    total_q_capacity
+                )
+                sparse_md = make_minimax_m3_sparse_small_q_decode_metadata(
                     seq_lens=seq_lens,
-                    block_table=attn_metadata.block_tables[:scheduled_bs],
+                    query_seq_lens=query_seq_lens,
+                    query_block_table=query_block_table,
+                    prefix_lens=prefix_lens,
+                    block_table=attn_metadata.block_tables[:bs],
                     slot_mapping=attn_metadata.slot_mapping,
                     max_query_len=max_seqlen_q,
                     max_seq_len=int(max_seqlen_k),
-                    num_prefills=scheduled_bs,
+                    decode_seq_lens=query_seq_lens,
                 )
-                sparse_md.prefill.context_lens = prefix_lens
                 attn_metadata.minimax_m3_sparse_metadata = sparse_md
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q
@@ -1174,7 +1242,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if self._is_minimax_m3_sparse:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_minimax_m3_sparse_decode_metadata,
-                make_minimax_m3_sparse_prefill_metadata,
+                make_minimax_m3_sparse_small_q_decode_metadata,
             )
 
             seq_lens = attn_metadata.context_lens
@@ -1199,16 +1267,36 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 pf = self.model_runner.forward_vars["sparse_prefix_lens"]
                 prefix_lens = pf.gpu[:bs]
                 torch.sub(seq_lens, query_lens, out=prefix_lens)
-                sparse_md = make_minimax_m3_sparse_prefill_metadata(
-                    cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                query_seq_lens = self.model_runner.forward_vars[
+                    "sparse_decode_seq_lens"
+                ].gpu[:total_tokens]
+                query_block_table = self.model_runner.forward_vars[
+                    "sparse_decode_block_tables"
+                ].gpu[:total_tokens]
+                req_ids = torch.arange(bs, dtype=torch.int32, device=self.device)
+                req_ids = torch.repeat_interleave(req_ids, max_q_len)
+                q_offsets = torch.arange(
+                    max_q_len, dtype=torch.int32, device=self.device
+                ).repeat(bs)
+                query_block_table.copy_(
+                    torch.index_select(attn_metadata.block_tables, 0, req_ids.long())
+                )
+                torch.minimum(
+                    seq_lens[req_ids.long()],
+                    prefix_lens[req_ids.long()] + q_offsets + 1,
+                    out=query_seq_lens,
+                )
+                sparse_md = make_minimax_m3_sparse_small_q_decode_metadata(
                     seq_lens=seq_lens,
+                    query_seq_lens=query_seq_lens,
+                    query_block_table=query_block_table,
+                    prefix_lens=prefix_lens,
                     block_table=attn_metadata.block_tables,
                     slot_mapping=attn_metadata.slot_mapping,
                     max_query_len=max_q_len,
                     max_seq_len=attn_metadata.max_seqlen_k,
-                    num_prefills=bs,
+                    decode_seq_lens=query_seq_lens,
                 )
-                sparse_md.prefill.context_lens = prefix_lens
                 attn_metadata.minimax_m3_sparse_metadata = sparse_md
 
         positions = var["positions"].copy_to_gpu(total_tokens)

@@ -57,6 +57,16 @@ class MiniMaxM3SparseDecodeMetadata:
 
 
 @dataclass
+class MiniMaxM3SparseSmallQDecodeMetadata:
+    query_seq_lens: torch.Tensor
+    query_block_table: torch.Tensor
+    prefix_lens: torch.Tensor
+    block_table: torch.Tensor
+    max_query_len: int
+    decode_seq_lens: torch.Tensor | None = None
+
+
+@dataclass
 class MiniMaxM3SparseMetadata:
     seq_lens: torch.Tensor
     max_seq_len: int
@@ -64,6 +74,7 @@ class MiniMaxM3SparseMetadata:
     num_prefills: int
     prefill: MiniMaxM3SparsePrefillMetadata | None = None
     decode: MiniMaxM3SparseDecodeMetadata | None = None
+    small_q_decode: MiniMaxM3SparseSmallQDecodeMetadata | None = None
 
 
 def _build_prefill_query_metadata(
@@ -155,6 +166,37 @@ def make_minimax_m3_sparse_decode_metadata(
         num_prefills=0,
         prefill=None,
         decode=decode,
+    )
+
+
+def make_minimax_m3_sparse_small_q_decode_metadata(
+    *,
+    seq_lens: torch.Tensor,
+    query_seq_lens: torch.Tensor,
+    query_block_table: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    max_query_len: int,
+    max_seq_len: int,
+    decode_seq_lens: torch.Tensor | None = None,
+) -> MiniMaxM3SparseMetadata:
+    small_q_decode = MiniMaxM3SparseSmallQDecodeMetadata(
+        query_seq_lens=query_seq_lens,
+        query_block_table=query_block_table,
+        prefix_lens=prefix_lens,
+        block_table=block_table,
+        max_query_len=max_query_len,
+        decode_seq_lens=decode_seq_lens,
+    )
+    return MiniMaxM3SparseMetadata(
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        slot_mapping=slot_mapping,
+        num_prefills=0,
+        prefill=None,
+        decode=None,
+        small_q_decode=small_q_decode,
     )
 
 
@@ -759,8 +801,9 @@ def _merge_topk_attn_out_kernel(
     o = tl.load(o_ptrs, boundary_check=(0, 1), padding_option="zero")
     lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     lse_max = tl.max(lse, axis=0)
-    weights = tl.exp2(lse - lse_max)
-    weights = weights / tl.sum(weights, axis=0)
+    valid = lse_max > float("-inf")
+    weights = tl.where(valid, tl.exp2(lse - lse_max), tl.zeros_like(lse))
+    weights = tl.where(valid, weights / tl.sum(weights, axis=0), weights)
     o_merged = tl.sum(o * weights[:, None], axis=0)
     out_ptrs = (
         out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d

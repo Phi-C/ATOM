@@ -202,11 +202,18 @@ class PagedAttentionImpl(nn.Module):
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
         # Fall back to Triton/Gluon when explicitly requested or for layouts
-        # unsupported by AITer PA ASM.
+        # unsupported by AITer PA ASM. The non-persistent ASM PA decode
+        # (paged_attention_asm -> pa_fwd, ps=0) only ships blkSz=16 kernels for
+        # every dtype/gqa, so a block_size=128 cache can never resolve a kernel
+        # (get_heuristic_kernel aborts). block_size 256/1024 is served by the
+        # persistent ASM path in _dispatch_decode; everything else must use
+        # Triton. This also keeps the KV-cache write layout (asm_layout below)
+        # consistent with the decode kernel that reads it.
         use_triton_attn = (
             self.force_triton_attn
             or self.sliding_window != -1
             or self.head_dim != 128
+            or get_current_atom_config().kv_cache_block_size == 128
         )
         self.use_triton_attn = use_triton_attn
 
@@ -364,8 +371,16 @@ class PagedAttentionImpl(nn.Module):
                 )
             self._cache_format = "SHUFFLE" if asm_layout else "NHD"
 
-        # Prefix cache hit: gather cached KV from paged cache and concat with new tokens
-        if attn_metadata.has_cached:
+        # Prefix-cache hit: gather the full (cached + new) KV from the paged
+        # cache into contiguous k_full/v_full for the varlen prefill kernels.
+        # ONLY the prefill backends consume that gathered K/V; every decode
+        # backend (paged_attention_triton / _asm / _persistent_asm) reads the
+        # paged k_cache/v_cache directly via block_tables and discards k_full.
+        # So gather only when prefilling — guarding on is_prefill avoids an
+        # O(whole KV pool) permute+contiguous whose result decode never uses
+        # (e.g. the Eagle3 MHA draft, which decodes with has_cached every step
+        # and was paying a full ~12GB cache copy per draft iteration).
+        if attn_metadata.has_cached and fwd_ctx.context.is_prefill:
             q, k, v, k_cache, v_cache, k_scale, v_scale = (
                 self._gather_prefix_and_concat_kv(
                     q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata

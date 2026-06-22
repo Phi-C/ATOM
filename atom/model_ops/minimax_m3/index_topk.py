@@ -688,8 +688,6 @@ def minimax_m3_index_topk(
         MASK_LOCAL=False,
     )
     return topk_idx
-
-
 @torch.no_grad()
 def minimax_m3_index_topk_decode(
     idx_q: torch.Tensor,  # [batch, num_idx_heads, head_dim]
