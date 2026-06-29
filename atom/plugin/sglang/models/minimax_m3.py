@@ -4,14 +4,34 @@ from types import MethodType
 
 import torch
 
-from atom.models.minimax_m3 import (
-    MiniMaxM3Attention,
-    MiniMaxM3SparseAttention,
-    _minimax_m3_gemma_qk_norm,
-)
+from atom.model_ops.layernorm import fused_qk_norm
+from atom.models.minimax_m3 import MiniMaxM3Attention, MiniMaxM3SparseAttention
 from atom.plugin.sglang.attention_backend.minimax_m3_sparse import (
     minimax_m3_sparse_attention_for_sglang,
 )
+
+
+def _gemma_qk_norm_for_sglang(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm,
+    k_norm,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q, k = fused_qk_norm(
+        q.view(-1, num_q_heads, head_dim),
+        k.view(-1, num_kv_heads, head_dim),
+        q_norm.weight,
+        k_norm.weight,
+        q_norm.variance_epsilon,
+        add_unit_offset=True,
+    )
+    return (
+        q.view(-1, num_q_heads * head_dim),
+        k.view(-1, num_kv_heads * head_dim),
+    )
 
 
 def _patch_minimax_m3_dense_attention_for_sglang(module: MiniMaxM3Attention) -> None:
@@ -39,7 +59,7 @@ def _sparse_forward_for_sglang(
         ],
         dim=-1,
     )
-    q, k = _minimax_m3_gemma_qk_norm(
+    q, k = _gemma_qk_norm_for_sglang(
         q,
         k,
         self.q_norm,
@@ -50,7 +70,7 @@ def _sparse_forward_for_sglang(
     )
     q, k = self.rotary_emb(positions, q, k)
 
-    index_q, index_k = _minimax_m3_gemma_qk_norm(
+    index_q, index_k = _gemma_qk_norm_for_sglang(
         index_q,
         index_k,
         self.index_q_norm,
