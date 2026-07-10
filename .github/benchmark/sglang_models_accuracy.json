@@ -111,7 +111,10 @@
     "runner": "atom-mi355-8gpu-conductor-sgl-runner",
     "test_level": "nightly",
     "lm_eval_num_fewshot": 5,
-    "accuracy_threshold": 0.88,
+    "lm_eval_num_concurrent": 32,
+    "lm_eval_use_chat_completions": "1",
+    "lm_eval_extra_model_args": "max_gen_toks=16384",
+    "accuracy_threshold": 0.93,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "amd/MiniMax-M3-MXFP4",
     "_baseline_note": "SGLang-ATOM MiniMax-M3-MXFP4 TP4 measured on GSM8K benchmark."
