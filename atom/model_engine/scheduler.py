@@ -1750,19 +1750,35 @@ class Scheduler:
             except (TypeError, ValueError):
                 return None
 
+        is_producer = bool(getattr(self.kv_connector, "is_producer", False))
+        is_offload = self._is_offload_connector()
+
         for req_id in kv_connector_output.finished_recving or ():
             assert (
-                not self.kv_connector.is_producer
+                not is_producer
             ), "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_recving or ():
             assert (
-                not self.kv_connector.is_producer
+                not is_producer
             ), "Only consumer should update failed KV recv status"
             logger.warning(
                 "KV receive failed for request %s; falling back to prefill.", req_id
+            )
+            self.failed_recving_kv_req_ids.append(req_id)
+
+        for req_id in kv_connector_output.finished_loading or ():
+            assert is_offload, "Only offload connector should update loading KV status"
+            logger.debug("Finished offload KV load for request %s", req_id)
+            self.finished_recving_kv_req_ids.append(req_id)
+
+        for req_id in kv_connector_output.failed_loading or ():
+            assert is_offload, "Only offload connector should update failed KV load status"
+            logger.warning(
+                "Offload KV load failed for request %s; falling back to prefill.",
+                req_id,
             )
             self.failed_recving_kv_req_ids.append(req_id)
 
