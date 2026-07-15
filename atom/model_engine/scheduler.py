@@ -1754,16 +1754,12 @@ class Scheduler:
         is_offload = self._is_offload_connector()
 
         for req_id in kv_connector_output.finished_recving or ():
-            assert (
-                not is_producer
-            ), "Only consumer should update recving KV status"
+            assert not is_producer, "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_recving or ():
-            assert (
-                not is_producer
-            ), "Only consumer should update failed KV recv status"
+            assert not is_producer, "Only consumer should update failed KV recv status"
             logger.warning(
                 "KV receive failed for request %s; falling back to prefill.", req_id
             )
@@ -1775,7 +1771,9 @@ class Scheduler:
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_loading or ():
-            assert is_offload, "Only offload connector should update failed KV load status"
+            assert (
+                is_offload
+            ), "Only offload connector should update failed KV load status"
             logger.warning(
                 "Offload KV load failed for request %s; falling back to prefill.",
                 req_id,
