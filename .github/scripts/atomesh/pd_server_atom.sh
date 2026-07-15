@@ -385,7 +385,11 @@ start_prefill() {
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   local prefill_kv_transfer_config
-  prefill_kv_transfer_config="${PREFILL_KV_TRANSFER_CONFIG:-{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}}"
+  if [[ -n "${PREFILL_KV_TRANSFER_CONFIG}" ]]; then
+    prefill_kv_transfer_config="${PREFILL_KV_TRANSFER_CONFIG}"
+  else
+    prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
+  fi
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -424,7 +428,11 @@ start_decode() {
   local -a decode_cache_env=()
   build_server_cache_env "decode" "${server_port}" decode_cache_env
   local decode_kv_transfer_config
-  decode_kv_transfer_config="${DECODE_KV_TRANSFER_CONFIG:-{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}}"
+  if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
+    decode_kv_transfer_config="${DECODE_KV_TRANSFER_CONFIG}"
+  else
+    decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${HANDSHAKE_PORT}}"
+  fi
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} cudagraph=${DECODE_CUDAGRAPH:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server

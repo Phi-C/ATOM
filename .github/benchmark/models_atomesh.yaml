@@ -266,7 +266,7 @@ models:
         - name: minimax-m3-fp4-1p1d-tp4-agentic-lmcache-256k
           topology: 1p1d
           display_topology: 1P1D-TP4-agentic
-          pd_worker_layout: single_node
+          pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [262144]
           osl: 1024
@@ -288,14 +288,12 @@ models:
             common:
               PYTHONHASHSEED: "0"
             prefill:
-              HIP_VISIBLE_DEVICES: "0,1,2,3"
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
               LMCACHE_CHUNK_SIZE: "256"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode:
-              HIP_VISIBLE_DEVICES: "4,5,6,7"
+            decode: {}
           benchmark:
             kind: aiperf_agentic
             scenario: inferencex-agentx-mvp
