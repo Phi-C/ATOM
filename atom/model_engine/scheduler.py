@@ -1075,7 +1075,7 @@ class Scheduler:
             return None
 
         seq.status = SequenceStatus.WAITING
-        if self._is_offload_connector():
+        if self._connector_flag("is_offload"):
             self._mark_offload_load_ready(seq)
             return False
         return True
@@ -1114,7 +1114,7 @@ class Scheduler:
         allocated before it parked for the LMCache load.
         """
         return (
-            self._is_offload_connector()
+            self._connector_flag("is_offload")
             and (
                 getattr(seq, "offload_loaded", False)
                 or getattr(seq, "offload_load_failed", False)
@@ -1597,13 +1597,8 @@ class Scheduler:
             self.running.remove(seq)
         return finished_seqs
 
-    def _is_offload_connector(self) -> bool:
-        """True when the active KV connector is the CPU/NVMe offload backend.
-
-        Offload wakes a parked seq into a SUFFIX prefill (not the P/D decode
-        jump). Connectors set ``is_offload = True`` to opt into this path.
-        """
-        return getattr(self.kv_connector, "is_offload", False)
+    def _connector_flag(self, name: str) -> bool:
+        return bool(getattr(self.kv_connector, name, False))
 
     @staticmethod
     def _has_req_id(req_ids: list, seq_id) -> bool:
@@ -1750,8 +1745,8 @@ class Scheduler:
             except (TypeError, ValueError):
                 return None
 
-        is_producer = bool(getattr(self.kv_connector, "is_producer", False))
-        is_offload = self._is_offload_connector()
+        is_producer = self._connector_flag("is_producer")
+        is_offload = self._connector_flag("is_offload")
 
         for req_id in kv_connector_output.finished_recving or ():
             assert not is_producer, "Only consumer should update recving KV status"
